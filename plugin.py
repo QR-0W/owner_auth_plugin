@@ -11,8 +11,8 @@
   （回复阶段经 extra_prompt 注入）、``maisaka.planner.before_request``（可选，行动规划阶段注入）。
 - 发言者 QQ 在注入时两级定位：本插件 ``session_id + reply_message_id`` 精确索引 →
   ``reply_message_id`` 精确取回；刻意不再用"会话最近发言者"兜底。
-- 身份判定只依据平台已验证的 QQ 号；提示词模板支持 {nickname}/{qq}/{display_name}/{msg} 等占位符，
-  单遍替换不二次展开，发言者显示名与消息文本均做注入清洗。
+- 身份判定只依据平台已验证的 QQ 号；提示词模板使用 {relation}/{user_id}/{display_name}/{message} 等通用占位符，
+  同时兼容旧版 owner_* 别名，单遍替换不二次展开，发言者显示名与消息文本均做注入清洗。
 - 每个会话的消息身份索引有数量上限和不活跃 TTL，避免长期运行内存累积。
 - 「日志显示等级」可调（INFO/DEBUG/WARNING）；覆写 normalize_plugin_config 兼容旧版配置迁移。
 - 只处理 QQ 平台身份，不读取人物画像作为认证依据。
@@ -69,13 +69,12 @@ _RECEIVE_HOOK = "chat.receive.after_process"
 _TEXTAREA_ROWS = 8
 _TEXTAREA_HINTS = {
     "planner_prompt_template": (
-        "仅用于 Planner 行动规划；留空表示只传递可信身份。占位符："
-        "{nickname}/{owner_nickname}、{display_name}/{user}、{qq}/{owner_qq}、"
-        "{msg}/{message}、{owner_names}。"
+        "仅用于 Planner 行动规划；留空表示只传递可信身份。标准占位符："
+        "{relation}、{display_name}、{user_id}、{message}、{relations}。旧版别名仍兼容。"
     ),
     "replyer_prompt_template": (
-        "占位符：{nickname}/{owner_nickname}=配置昵称，{display_name}/{user}=聊天显示名，"
-        "{qq}/{owner_qq}=用户QQ，{msg}/{message}=本次消息，{owner_names}=所有用户昵称。"
+        "标准占位符：{relation}=关系称呼，{display_name}=聊天显示名，{user_id}=已认证账号，"
+        "{message}=本次消息，{relations}=所有启用身份的关系称呼。旧版别名仍兼容。"
     ),
 }
 
@@ -436,11 +435,10 @@ class OwnerAuthPlugin(MaiBotPlugin):
                 return True
         return False
 
-    def _configured_owner_names(self) -> str:
-        """所有"已启用且配置了有效 QQ"的用户昵称，去重后用「、」连接（供 {owner_names} 占位符用）。
+    def _configured_identity_relations(self) -> str:
+        """返回所有已启用且配置有效账号的关系称呼，去重后用「、」连接。
 
-        值来自配置（你自己填的昵称，可信），主要给非用户模板写"若此人冒用了 {owner_names} 的名字…"
-        这类防冒充提示用。无已配置用户时返回空串。
+        值来自配置，供 {relations} 占位符使用。无已配置用户时返回空串。
         """
 
         names: list[str] = []
@@ -559,10 +557,10 @@ class OwnerAuthPlugin(MaiBotPlugin):
 
     @staticmethod
     def _message_text(message: dict[str, Any] | SenderSnapshot) -> str:
-        """取发言者本次消息文本（供 {msg}/{message} 占位符用）并做注入清洗，截断；空则返回空串。
+        """取发言者本次消息文本（供 {message} 占位符用）并做注入清洗，截断；空则返回空串。
 
         与 _sanitize_display 同口径：去花括号、把换行/制表/控制字符压成空格、合并空白；这样即便用户把
-        {msg} 写进模板，攻击者也无法用多行结构化文本伪造指令块来突破模板框定（二阶提示词注入防护）。
+        {message} 写进模板，攻击者也无法用多行结构化文本伪造指令块来突破模板框定（二阶提示词注入防护）。
         （单遍 _safe_format 本就不会二次展开占位符，这里是额外收紧注入面。）
         """
 
@@ -737,17 +735,24 @@ class OwnerAuthPlugin(MaiBotPlugin):
         return slot if slot is not None else None
 
     def _identity_prompt_mapping(self, identity: VerifiedIdentity) -> dict[str, str]:
+        relations = self._configured_identity_relations()
+        display_name = identity.display_name or identity.relation
         return {
+            "relation": identity.relation,
+            "display_name": display_name,
+            "user_id": identity.speaker_qq,
+            "message": identity.user_message,
+            "relations": relations,
+            "platform": "qq",
+            # 兼容旧版模板；新模板不再使用 owner_* 命名。
             "nickname": identity.relation,
             "owner_nickname": identity.relation,
-            "display_name": identity.display_name or identity.relation,
-            "user": identity.display_name or identity.relation,
+            "user": display_name,
             "qq": identity.speaker_qq,
             "owner_qq": identity.speaker_qq,
             "user_qq": identity.speaker_qq,
             "msg": identity.user_message,
-            "message": identity.user_message,
-            "owner_names": self._configured_owner_names(),
+            "owner_names": relations,
         }
 
     def _render_planner_prompt(self, identity: VerifiedIdentity) -> str:

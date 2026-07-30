@@ -215,7 +215,7 @@ def test_planner_policy_is_deduplicated_and_inserted_in_dynamic_tail(monkeypatch
     monkeypatch.setattr(plugin_module, "_USER_SLOTS", 2)
     plugin = _configured_plugin()
     plugin.config.plugin.user_count = 2
-    plugin.config.user1.planner_prompt_template = "优先关注{nickname}的实际需求。"
+    plugin.config.user1.planner_prompt_template = "优先关注{relation}的实际需求。"
     plugin.config.user2 = SimpleNamespace(
         enabled=True,
         qq="1888888888",
@@ -272,7 +272,7 @@ def test_blank_planner_policy_keeps_identity_only_without_empty_block() -> None:
 
 def test_replyer_policy_is_appended_after_identity_receipt() -> None:
     plugin = _configured_plugin()
-    plugin.config.user1.replyer_prompt_template = "需要称呼时叫{nickname}，保持对{display_name}自然熟悉。"
+    plugin.config.user1.replyer_prompt_template = "需要称呼时叫{relation}，保持对{display_name}自然熟悉。"
     asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
 
     result = asyncio.run(
@@ -288,6 +288,27 @@ def test_replyer_policy_is_appended_after_identity_receipt() -> None:
     assert "需要称呼时叫主人" in prompt
     assert "对Qr0w_自然熟悉" in prompt
     assert "已验证关系规划便签" not in prompt
+
+
+def test_prompt_mapping_uses_generic_names_and_keeps_legacy_aliases() -> None:
+    plugin = _configured_plugin()
+    snapshot = plugin._snapshot_from_message(_message(message_id="owner-msg", user_id="1549785199"))
+    assert snapshot is not None
+    identity = plugin._verify_snapshot(snapshot)
+    assert identity is not None
+
+    mapping = plugin._identity_prompt_mapping(identity)
+    assert mapping["relation"] == "主人"
+    assert mapping["display_name"] == "Qr0w_"
+    assert mapping["user_id"] == "1549785199"
+    assert mapping["message"] == "测试消息"
+    assert mapping["relations"] == "主人"
+    assert mapping["nickname"] == mapping["relation"]
+    assert mapping["owner_nickname"] == mapping["relation"]
+    assert mapping["qq"] == mapping["user_id"]
+    assert mapping["owner_qq"] == mapping["user_id"]
+    assert mapping["msg"] == mapping["message"]
+    assert mapping["owner_names"] == mapping["relations"]
 
 
 def test_legacy_prompt_migrates_only_to_replyer(monkeypatch) -> None:
@@ -327,7 +348,7 @@ def test_legacy_prompt_migrates_only_to_replyer(monkeypatch) -> None:
     assert migrated["user1"]["planner_prompt_template"] == plugin_module._DEFAULT_PLANNER_TEMPLATE
     assert "prompt_template" not in migrated["user1"]
     assert "non_owner" not in migrated
-    assert migrated["plugin"]["config_version"] == "2.2.0"
+    assert migrated["plugin"]["config_version"] == "2.2.1"
     assert any("已迁入 Replyer 回复便签" in message for message in plugin.ctx.logger.messages)
 
     migrated_again, changed_again = plugin.normalize_plugin_config(migrated)
@@ -408,5 +429,13 @@ def test_webui_schema_exposes_split_prompts_without_non_owner_section() -> None:
     assert "planner_prompt_template" in sections["user1"]["fields"]
     assert "replyer_prompt_template" in sections["user1"]["fields"]
     assert "prompt_template" not in sections["user1"]["fields"]
+    planner_hint = sections["user1"]["fields"]["planner_prompt_template"]["hint"]
+    replyer_hint = sections["user1"]["fields"]["replyer_prompt_template"]["hint"]
+    assert "{relation}" in planner_hint
+    assert "{user_id}" in planner_hint
+    assert "{message}" in replyer_hint
+    assert "{relations}" in replyer_hint
+    assert "{owner_" not in planner_hint
+    assert "{owner_" not in replyer_hint
     tabs = schema["layout"]["tabs"]
     assert [tab["id"] for tab in tabs] == ["basic", "users"]

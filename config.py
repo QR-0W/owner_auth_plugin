@@ -16,7 +16,7 @@ from maibot_sdk import PluginConfigBase
 from pydantic import Field, create_model
 
 # 插件 / 配置版本号（plugin.py、_manifest.json 与本文件保持一致）。
-PLUGIN_VERSION = "2.2.0"
+PLUGIN_VERSION = "2.2.1"
 
 # 生成的用户槽位数 USER_SLOTS = 已保存的 user_count —— 不写死上限、也不留多余空槽位
 # （config.toml 里有几个用户就几个 [userN] 表，干净）。固定槽位（每用户独立多行模板、非动态列表）天生
@@ -42,12 +42,12 @@ def _saved_user_count() -> int:
 USER_SLOTS = max(_saved_user_count(), 1)
 
 DEFAULT_REPLYER_TEMPLATE = (
-    "回复「{nickname}」时保持自然、熟悉且更上心的语气；需要直接称呼时使用「{nickname}」，"
+    "回复「{relation}」时保持自然、熟悉且更上心的语气；需要直接称呼时使用「{relation}」，"
     "不要机械地在每句话重复身份，也不要为了表现亲近而牺牲事实判断、安全边界或当前任务。"
 )
 
 DEFAULT_PLANNER_TEMPLATE = (
-    "规划涉及已验证的「{nickname}」时，对其当前需求、状态和此前提过的细节额外上心；"
+    "规划涉及已验证的「{relation}」时，对其当前需求、状态和此前提过的细节额外上心；"
     "可以更主动地追问、分享或提供具体帮助，但仍保持事实判断、安全边界和独立判断。"
 )
 
@@ -116,7 +116,7 @@ class UserSlotConfig(PluginConfigBase):
     )
     nickname: str = Field(
         default="用户",
-        description="对该用户的称呼，会替换模板中的 {nickname}/{owner_nickname}",
+        description="对该身份的关系称呼，会替换模板中的 {relation}",
         json_schema_extra={"label": "用户昵称"},
     )
     group_id: str = Field(
@@ -131,8 +131,8 @@ class UserSlotConfig(PluginConfigBase):
         default=DEFAULT_PLANNER_TEMPLATE,
         description=(
             "该用户专属的 Planner 规划便签（支持多行，留空则 Planner 只接收可信身份标识）。占位符："
-            "{nickname}/{owner_nickname}=配置称呼，{display_name}/{user}=聊天显示名，"
-            "{qq}/{owner_qq}=用户QQ，{msg}/{message}=该用户消息，{owner_names}=所有用户称呼"
+            "{relation}=关系称呼，{display_name}=聊天显示名，{user_id}=已认证账号，"
+            "{message}=该用户消息，{relations}=所有启用身份的关系称呼"
         ),
         json_schema_extra={"label": "Planner 规划便签"},
     )
@@ -140,8 +140,8 @@ class UserSlotConfig(PluginConfigBase):
         default=DEFAULT_REPLYER_TEMPLATE,
         description=(
             "该用户专属的 Replyer 回复便签（支持多行，留空则 Replyer 只接收可信身份凭证）。占位符："
-            "{nickname}/{owner_nickname}=配置昵称，{display_name}/{user}=聊天显示名，"
-            "{qq}/{owner_qq}=用户QQ，{msg}/{message}=发言者本次消息，{owner_names}=所有用户昵称"
+            "{relation}=关系称呼，{display_name}=聊天显示名，{user_id}=已认证账号，"
+            "{message}=发言者本次消息，{relations}=所有启用身份的关系称呼"
         ),
         json_schema_extra={"label": "Replyer 回复便签"},
     )

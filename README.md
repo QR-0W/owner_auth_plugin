@@ -2,7 +2,7 @@
 
 通过 QQ 号精确认证配置中的特殊用户，并把可信身份及分阶段关系便签发送给 MaiBot 的 Planner 和 Replyer。
 
-v2.2.0 面向 MaiBot 1.0.x / maibot_sdk 2.x，使用官方 Hook，不修改 MaiBot 主程序，不读取人物画像作为身份依据。
+v2.2.1 面向 MaiBot 1.0.x / maibot_sdk 2.x，使用官方 Hook，不修改 MaiBot 主程序，不读取人物画像作为身份依据。
 
 ## 功能
 
@@ -49,15 +49,17 @@ v2.2.0 面向 MaiBot 1.0.x / maibot_sdk 2.x，使用官方 Hook，不修改 MaiB
 | Planner 规划便签 | 只影响行动规划；留空表示 Planner Identity Only |
 | Replyer 回复便签 | 只影响最终措辞；留空表示 Replyer Identity Only |
 
-两个便签都支持以下占位符：
+两个便签都支持以下标准占位符：
 
 | 占位符 | 含义 |
 | --- | --- |
-| `{nickname}` / `{owner_nickname}` | 配置中的关系称呼 |
-| `{display_name}` / `{user}` | 已清洗的聊天显示名 |
-| `{qq}` / `{owner_qq}` / `{user_qq}` | 已认证 QQ 号 |
-| `{msg}` / `{message}` | 已清洗并截断的目标消息文本 |
-| `{owner_names}` | 所有启用用户的关系称呼 |
+| `{relation}` | 当前身份的关系称呼，例如“主人” |
+| `{display_name}` | 已清洗的聊天显示名 |
+| `{user_id}` | 已认证的平台账号 ID |
+| `{message}` | 已清洗并截断的目标消息文本 |
+| `{relations}` | 所有启用身份的关系称呼 |
+
+旧版 Prompt 使用的 `{nickname}`、`{owner_nickname}`、`{qq}`、`{owner_qq}`、`{user_qq}`、`{msg}`、`{user}` 和 `{owner_names}` 仍作为兼容别名保留，但新配置不建议继续使用 `owner_*` 命名。
 
 配置值只做单遍占位符替换，不会二次展开。
 
