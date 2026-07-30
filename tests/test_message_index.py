@@ -190,6 +190,4 @@ def test_message_index_is_bounded_per_session() -> None:
 
     assert plugin._message_index_size() == plugin_module._MESSAGE_INDEX_LIMIT_PER_SESSION
     assert plugin._get_cached_snapshot("group-a", "msg-0") is None
-    assert plugin._get_cached_snapshot(
-        "group-a", f"msg-{plugin_module._MESSAGE_INDEX_LIMIT_PER_SESSION}"
-    ) is not None
+    assert plugin._get_cached_snapshot("group-a", f"msg-{plugin_module._MESSAGE_INDEX_LIMIT_PER_SESSION}") is not None

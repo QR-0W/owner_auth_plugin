@@ -51,6 +51,7 @@ DEFAULT_PLANNER_TEMPLATE = (
     "可以更主动地追问、分享或提供具体帮助，但仍保持事实判断、安全边界和独立判断。"
 )
 
+
 class GeneralSectionConfig(PluginConfigBase):
     """通用设置（位于「插件」页）。"""
 

@@ -88,9 +88,7 @@ _LOG_LEVEL_HINT = (
 _CACHE_TTL_HINT = "消息身份索引的会话不活跃清理时间；活跃会话内的单条消息不会中途掉标，默认 300 秒。"
 
 # 「限制群聊（群号）」字段的下方小字提示（每个用户分区都有该字段）。
-_GROUP_ID_HINT = (
-    "填群号＝该用户仅在此群生效；留空＝所有会话（含私聊）。同一 QQ 可分置全局与群专属，群专属优先。"
-)
+_GROUP_ID_HINT = "填群号＝该用户仅在此群生效；留空＝所有会话（含私聊）。同一 QQ 可分置全局与群专属，群专属优先。"
 
 # 「用户数量控制」字段的下方小字提示：讲清"数字=生成的槽位个数"以及"调小即抹除多出用户"的语义。
 _USER_COUNT_HINT = (
@@ -179,9 +177,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
 
     # ─── 旧版配置迁移 + 数量约束 ─────────────────────────────
 
-    def normalize_plugin_config(
-        self, config_data: dict[str, Any] | None
-    ) -> tuple[dict[str, Any], bool]:
+    def normalize_plugin_config(self, config_data: dict[str, Any] | None) -> tuple[dict[str, Any], bool]:
         """把旧版（单用户 [user] / 列表版 [users] / 0.x owner_auth）迁移到固定槽位结构，
         并按 user_count 清空超出的槽位（实现"调小数字即抹除多出用户"）。
 
@@ -470,9 +466,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
         matched = self._match_user_entry(speaker_qq, current_group_id)
         return matched[1] if matched is not None else None
 
-    def _match_user_entry(
-        self, speaker_qq: str, current_group_id: str = ""
-    ) -> tuple[str, UserSlotConfig] | None:
+    def _match_user_entry(self, speaker_qq: str, current_group_id: str = "") -> tuple[str, UserSlotConfig] | None:
         """按 QQ 和群范围返回稳定槽位键；群专属仍优先于全局。"""
 
         target = self._norm_qq(speaker_qq)
@@ -573,9 +567,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
         """
 
         text = (
-            message.processed_plain_text
-            if isinstance(message, SenderSnapshot)
-            else message.get("processed_plain_text")
+            message.processed_plain_text if isinstance(message, SenderSnapshot) else message.get("processed_plain_text")
         )
         if not isinstance(text, str):
             return ""
@@ -663,9 +655,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
         speaker_qq = cls._norm_qq(user_info.get("user_id"))
         if platform != "qq" or not session_id or not message_id or not speaker_qq:
             return None
-        display_name = cls._sanitize_display(
-            user_info.get("user_cardname") or user_info.get("user_nickname") or ""
-        )
+        display_name = cls._sanitize_display(user_info.get("user_cardname") or user_info.get("user_nickname") or "")
         group_id = cls._norm_group(group_info.get("group_id")) if isinstance(group_info, dict) else ""
         processed_plain_text = message.get("processed_plain_text")
         return SenderSnapshot(
@@ -777,9 +767,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
             prompt = self._render_planner_prompt(identity)
             if not prompt:
                 continue
-            policies.append(
-                f"identity={identity.identity_key}，关系={identity.relation}：\n{prompt}"
-            )
+            policies.append(f"identity={identity.identity_key}，关系={identity.relation}：\n{prompt}")
         if not policies:
             return ""
         return "【已验证关系规划便签】\n" + "\n\n".join(policies)
@@ -795,9 +783,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
             insert_at -= 1
         messages.insert(insert_at, {"role": "user", "content": policy_block})
 
-    def _annotate_planner_text(
-        self, text: str, session_id: str
-    ) -> tuple[str, VerifiedIdentity | None]:
+    def _annotate_planner_text(self, text: str, session_id: str) -> tuple[str, VerifiedIdentity | None]:
         """在单条 Planner 文本的 message 开始标签中写入可信身份属性。"""
 
         match = _MESSAGE_OPEN_TAG_RE.match(text)
@@ -823,11 +809,9 @@ class OwnerAuthPlugin(MaiBotPlugin):
                 f' relation="{escape(identity.relation, quote=True)}"'
             )
         rebuilt_tag = f"<message{f' {clean_attrs}' if clean_attrs else ''}{identity_attrs}>"
-        return f"{rebuilt_tag}{text[match.end():]}", identity
+        return f"{rebuilt_tag}{text[match.end() :]}", identity
 
-    def _annotate_planner_content(
-        self, content: Any, session_id: str
-    ) -> tuple[Any, VerifiedIdentity | None]:
+    def _annotate_planner_content(self, content: Any, session_id: str) -> tuple[Any, VerifiedIdentity | None]:
         """标注字符串或多模态 content 中的首个 Planner 消息文本片段。"""
 
         if isinstance(content, str):
@@ -845,9 +829,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
                 return updated, identity
         return updated if updated != content else content, None
 
-    def _annotate_planner_messages(
-        self, messages: list[Any], session_id: str
-    ) -> list[VerifiedIdentity]:
+    def _annotate_planner_messages(self, messages: list[Any], session_id: str) -> list[VerifiedIdentity]:
         """标注本次 Planner 消息副本，并按槽位键去重返回命中的身份。"""
 
         identities: dict[str, VerifiedIdentity] = {}
@@ -943,9 +925,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
         order=HookOrder.EARLY,
         error_policy=ErrorPolicy.SKIP,  # 钩子调用失败（含宿主编码消息 OOM）一律跳过，不拖垮入站处理
     )
-    async def index_sender_message(
-        self, message: dict[str, Any] | None = None, **kwargs: Any
-    ) -> None:
+    async def index_sender_message(self, message: dict[str, Any] | None = None, **kwargs: Any) -> None:
         # 只读观察：不改写消息、不中止链路（返回 None 直接放行）；异常一律吞掉但记 debug，绝不影响入站。
         try:
             if not isinstance(message, dict):
@@ -987,9 +967,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
             reply_message_id = str(kwargs.get("reply_message_id") or "").strip()
             session_id = str(kwargs.get("session_id") or "").strip()
 
-            snapshot, source, diag = await self._resolve_speaker_snapshot(
-                session_id, reply_message_id
-            )
+            snapshot, source, diag = await self._resolve_speaker_snapshot(session_id, reply_message_id)
             if snapshot is None:
                 self._fail_closed_count += 1
                 if log_on:
@@ -1241,9 +1219,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
                 {"id": "basic", "title": "插件", "icon": "settings", "order": 1, "sections": plugin_tab_sections}
             )
         if users_tab_sections:
-            tabs.append(
-                {"id": "users", "title": "用户", "icon": "users", "order": 2, "sections": users_tab_sections}
-            )
+            tabs.append({"id": "users", "title": "用户", "icon": "users", "order": 2, "sections": users_tab_sections})
         if tabs:
             # Dashboard 按数组顺序渲染标签页、忽略 order 字段，故显式按 order 排序使顺序可控。
             tabs.sort(key=lambda t: t["order"])
