@@ -97,11 +97,7 @@ def _configured_plugin() -> OwnerAuthPlugin:
             nickname="主人",
             group_id="",
             planner_prompt_template="",
-            prompt_template="不应出现在 Identity Only 请求中",
-        ),
-        non_owner=SimpleNamespace(
-            enable_non_owner_inject=True,
-            non_owner_prompt_template="不应注入非用户提示",
+            replyer_prompt_template="",
         ),
     )
     asyncio.run(plugin.on_load())
@@ -143,8 +139,7 @@ def test_planner_identity_only_marks_exact_message_and_keeps_protocol_stable() -
     assert 'verified_identity="user1" relation="主人"' in first[1]["content"]
     assert "verified_identity" not in first[2]["content"]
     rendered = "\n".join(str(message["content"]) for message in first)
-    assert "不应出现在 Identity Only 请求中" not in rendered
-    assert "不应注入非用户提示" not in rendered
+    assert "该身份回复便签" not in rendered
 
 
 def test_planner_multimodal_content_is_annotated_without_touching_image() -> None:
@@ -200,7 +195,7 @@ def test_replyer_identity_only_uses_exact_target_without_behavior_prompt() -> No
     assert "existing requirement" in extra_prompt
     assert "identity=user1" in extra_prompt
     assert "主人" in extra_prompt
-    assert "不应出现在 Identity Only 请求中" not in extra_prompt
+    assert "该身份回复便签" not in extra_prompt
 
     normal_result = asyncio.run(
         plugin.inject_user_identity(
@@ -223,7 +218,7 @@ def test_planner_policy_is_deduplicated_and_inserted_in_dynamic_tail(monkeypatch
         nickname='贵宾"组',
         group_id="",
         planner_prompt_template="为{display_name}规划简洁回应。",
-        prompt_template="unused",
+        replyer_prompt_template="",
     )
     asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
     asyncio.run(
@@ -273,3 +268,68 @@ def test_blank_planner_policy_keeps_identity_only_without_empty_block() -> None:
     asyncio.run(plugin.inject_planner_identity(messages=messages, session_id="group-a", tool_definitions=[]))
     assert all("已验证关系规划便签" not in str(message.get("content")) for message in messages)
     assert 'verified_identity="user1"' in messages[1]["content"]
+
+
+def test_replyer_policy_is_appended_after_identity_receipt() -> None:
+    plugin = _configured_plugin()
+    plugin.config.user1.replyer_prompt_template = "需要称呼时叫{nickname}，保持对{display_name}自然熟悉。"
+    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
+
+    result = asyncio.run(
+        plugin.inject_user_identity(
+            session_id="group-a",
+            reply_message_id="owner-msg",
+            extra_prompt="",
+        )
+    )
+    assert result is not None
+    prompt = result["modified_kwargs"]["extra_prompt"]
+    assert prompt.index("【可信身份】") < prompt.index("【该身份回复便签】")
+    assert "需要称呼时叫主人" in prompt
+    assert "对Qr0w_自然熟悉" in prompt
+    assert "已验证关系规划便签" not in prompt
+
+
+def test_legacy_prompt_migrates_only_to_replyer(monkeypatch) -> None:
+    plugin = _configured_plugin()
+    old_prompt = "这是旧版完整关系 Prompt"
+    disk = {
+        "plugin": {"user_count": 1, "config_version": "2.1.0"},
+        "user1": {
+            "enabled": True,
+            "qq": "1549785199",
+            "nickname": "主人",
+            "group_id": "",
+            "prompt_template": old_prompt,
+        },
+        "non_owner": {
+            "enable_non_owner_inject": True,
+            "non_owner_prompt_template": "旧非用户提示",
+        },
+    }
+    data = {
+        "plugin": {"user_count": 1, "config_version": "2.1.0"},
+        "user1": {
+            "enabled": True,
+            "qq": "1549785199",
+            "nickname": "主人",
+            "group_id": "",
+            "planner_prompt_template": plugin_module._DEFAULT_PLANNER_TEMPLATE,
+            "replyer_prompt_template": plugin_module._DEFAULT_REPLYER_TEMPLATE,
+        },
+        "non_owner": dict(disk["non_owner"]),
+    }
+    monkeypatch.setattr(plugin, "_read_disk_config", lambda: disk)
+
+    migrated, changed = plugin.normalize_plugin_config(data)
+    assert changed is True
+    assert migrated["user1"]["replyer_prompt_template"] == old_prompt
+    assert migrated["user1"]["planner_prompt_template"] == plugin_module._DEFAULT_PLANNER_TEMPLATE
+    assert "prompt_template" not in migrated["user1"]
+    assert "non_owner" not in migrated
+    assert migrated["plugin"]["config_version"] == "2.2.0"
+    assert any("已迁入 Replyer 回复便签" in message for message in plugin.ctx.logger.messages)
+
+    migrated_again, changed_again = plugin.normalize_plugin_config(migrated)
+    assert changed_again is False
+    assert migrated_again == migrated

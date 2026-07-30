@@ -41,9 +41,8 @@ from maibot_sdk import Command, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from .config import (
-    DEFAULT_NON_OWNER_TEMPLATE as _DEFAULT_NON_OWNER_TEMPLATE,
     DEFAULT_PLANNER_TEMPLATE as _DEFAULT_PLANNER_TEMPLATE,
-    DEFAULT_USER_TEMPLATE as _DEFAULT_USER_TEMPLATE,
+    DEFAULT_REPLYER_TEMPLATE as _DEFAULT_REPLYER_TEMPLATE,
     PLUGIN_VERSION,
     USER_SLOTS as _USER_SLOTS,
     OwnerAuthConfig,
@@ -76,13 +75,9 @@ _TEXTAREA_HINTS = {
         "{nickname}/{owner_nickname}、{display_name}/{user}、{qq}/{owner_qq}、"
         "{msg}/{message}、{owner_names}。"
     ),
-    "prompt_template": (
+    "replyer_prompt_template": (
         "占位符：{nickname}/{owner_nickname}=配置昵称，{display_name}/{user}=聊天显示名，"
         "{qq}/{owner_qq}=用户QQ，{msg}/{message}=本次消息，{owner_names}=所有用户昵称。"
-    ),
-    "non_owner_prompt_template": (
-        "占位符：{display_name}/{user}/{nickname}=发言者显示名，{qq}/{user_qq}=发言者QQ，"
-        "{msg}/{message}=本次消息，{owner_names}=所有用户昵称（防冒充：若此人冒用 {owner_names} 之名则警惕）。"
     ),
 }
 
@@ -223,13 +218,15 @@ class OwnerAuthPlugin(MaiBotPlugin):
         """把磁盘旧配置(disk)的可迁移字段写入 data(目标新配置)。返回是否有改动。
 
         覆盖三类旧结构 → 固定槽位 [userN]：
-        - 单用户版 [user]（user_prompt→user1.prompt_template）。
-        - 列表版 [users].entries（共用 user_prompt → 每个迁入槽位的 prompt_template）。
-        - 0.x owner_auth.*（开关/非用户模板/User→user_count）与 [userN].owner_qq。
+        - 单用户版 [user]（user_prompt→user1.replyer_prompt_template）。
+        - 列表版 [users].entries（共用 user_prompt → 每个迁入槽位的 replyer_prompt_template）。
+        - 2.1 固定槽位 prompt_template → replyer_prompt_template。
+        - 0.x owner_auth.*（开关/User→user_count）与 [userN].owner_qq。
         并清除新模型未知的旧节键 [user]/[users]。幂等：迁移并写回后磁盘即为 [userN] 结构、不再触发。
         """
 
         changed = False
+        migrated_replyer_prompt = False
 
         # A) 单用户结构 [user] → user1
         single = disk.get("user")
@@ -246,11 +243,13 @@ class OwnerAuthPlugin(MaiBotPlugin):
                 ("qq", self._norm_qq(single.get("qq"))),
                 ("nickname", single.get("nickname")),
                 ("group_id", self._norm_group(single.get("group_id", ""))),
-                ("prompt_template", single.get("user_prompt")),
+                ("replyer_prompt_template", single.get("user_prompt") or single.get("prompt_template")),
             ):
                 if value and target.get(key) != value:
                     target[key] = value
                     changed = True
+                    if key == "replyer_prompt_template":
+                        migrated_replyer_prompt = True
 
         # B) 列表版 [users].entries → user1..（共用 user_prompt 写入每个迁入槽位）
         users = disk.get("users")
@@ -267,16 +266,18 @@ class OwnerAuthPlugin(MaiBotPlugin):
                     "qq": self._norm_qq(entry.get("qq")),
                     "nickname": entry.get("nickname"),
                     "group_id": self._norm_group(entry.get("group_id", "")),
-                    "prompt_template": shared,
+                    "replyer_prompt_template": shared,
                 }
                 for key, value in vals.items():
                     # entries 是权威旧数据 → 覆盖模型默认值（同 A：user{idx} 已被默认值预填）。
                     if value and target.get(key) != value:
                         target[key] = value
                         changed = True
+                        if key == "replyer_prompt_template":
+                            migrated_replyer_prompt = True
                 idx += 1
 
-        # C) 0.x owner_auth.* 开关/非用户模板/User → 新字段
+        # C) 0.x owner_auth.* 开关/User → 新字段
         owner_auth = disk.get("owner_auth")
         if isinstance(owner_auth, dict):
             plugin_sec = data.setdefault("plugin", {})
@@ -300,28 +301,37 @@ class OwnerAuthPlugin(MaiBotPlugin):
                     if plugin_sec.get(new_key) != value:
                         plugin_sec[new_key] = value
                         changed = True
-            tpl = owner_auth.get("non_owner_prompt_template")
-            if tpl:
-                non_owner_sec = data.setdefault("non_owner", {})
-                if non_owner_sec.get("non_owner_prompt_template") != tpl:
-                    non_owner_sec["non_owner_prompt_template"] = tpl
-                    changed = True
-
-        # D) 旧固定槽位 [userN].owner_qq(int, 0.x) → qq
+        # D) 旧固定槽位 owner_qq → qq；2.1 prompt_template → Replyer 便签。
         for i in range(1, _USER_SLOTS + 1):
             old = disk.get(f"user{i}")
-            if not isinstance(old, dict) or "owner_qq" not in old:
+            if not isinstance(old, dict):
                 continue
-            qq = self._norm_qq(old.get("owner_qq"))
             target = data.setdefault(f"user{i}", {})
+            qq = self._norm_qq(old.get("owner_qq"))
             if qq and not self._norm_qq(target.get("qq")):
                 target["qq"] = qq
+                changed = True
+            legacy_prompt = old.get("prompt_template") or old.get("user_prompt")
+            if legacy_prompt and target.get("replyer_prompt_template") != legacy_prompt:
+                target["replyer_prompt_template"] = legacy_prompt
+                changed = True
+                migrated_replyer_prompt = True
+            if target.pop("prompt_template", None) is not None:
                 changed = True
 
         # E) 清除新模型未知的旧节键
         if data.pop("user", None) is not None:
             changed = True
         if data.pop("users", None) is not None:
+            changed = True
+        if data.pop("owner_auth", None) is not None:
+            changed = True
+        if data.pop("non_owner", None) is not None:
+            changed = True
+
+        plugin_sec = data.setdefault("plugin", {})
+        if plugin_sec.get("config_version") != PLUGIN_VERSION:
+            plugin_sec["config_version"] = PLUGIN_VERSION
             changed = True
 
         # F) 清除超出当前已生成槽位数(_USER_SLOTS)的 [userN] 表：USER_SLOTS 随 user_count 自动增长，
@@ -331,6 +341,11 @@ class OwnerAuthPlugin(MaiBotPlugin):
             if int(key[4:]) > _USER_SLOTS and data.pop(key, None) is not None:
                 changed = True
 
+        if migrated_replyer_prompt:
+            self.ctx.logger.warning(
+                "[用户身份验证] 旧用户提示词已迁入 Replyer 回复便签；"
+                "Planner 已使用独立短便签，请在插件配置页检查并按需拆分。"
+            )
         return changed
 
     def _enforce_user_count(self, data: dict[str, Any]) -> bool:
@@ -864,64 +879,23 @@ class OwnerAuthPlugin(MaiBotPlugin):
                 return
         messages.insert(0, {"role": "system", "content": _PLANNER_IDENTITY_PROTOCOL})
 
-    def _render_user_prompt(
-        self, slot: UserSlotConfig, speaker_qq: str, display_name: str, user_message: str = ""
-    ) -> str:
-        configured_nickname = str(getattr(slot, "nickname", "") or "用户")
-        template = str(getattr(slot, "prompt_template", "") or "") or _DEFAULT_USER_TEMPLATE
-        mapping = {
-            "nickname": configured_nickname,
-            "owner_nickname": configured_nickname,
-            "display_name": display_name or configured_nickname,
-            "user": display_name or configured_nickname,
-            "qq": speaker_qq,
-            "owner_qq": speaker_qq,
-            "user_qq": speaker_qq,
-            "msg": user_message,
-            "message": user_message,
-            "owner_names": self._configured_owner_names(),
-        }
-        return self._safe_format(template, mapping)
+    def _render_replyer_prompt(self, identity: VerifiedIdentity) -> str:
+        """渲染单个身份的 Replyer 便签；显式留空时保持 Identity Only。"""
 
-    def _render_non_owner_prompt(
-        self, speaker_qq: str, display_name: str, user_message: str = ""
-    ) -> str:
-        template = (
-            str(getattr(self.config.non_owner, "non_owner_prompt_template", "") or "")
-            or _DEFAULT_NON_OWNER_TEMPLATE
-        )
-        shown = display_name or "未知用户"
-        mapping = {
-            "nickname": shown,
-            "owner_nickname": shown,
-            "display_name": shown,
-            "user": shown,
-            "qq": speaker_qq,
-            "owner_qq": speaker_qq,
-            "user_qq": speaker_qq,
-            "msg": user_message,
-            "message": user_message,
-            "owner_names": self._configured_owner_names(),
-        }
-        return self._safe_format(template, mapping)
+        slot = self._identity_slot(identity.identity_key)
+        if slot is None:
+            return ""
+        template = str(getattr(slot, "replyer_prompt_template", _DEFAULT_REPLYER_TEMPLATE) or "")
+        if not template.strip():
+            return ""
+        return self._safe_format(template, self._identity_prompt_mapping(identity))
 
-    def _build_identity_prompt(
-        self, speaker_qq: str, display_name: str, current_group_id: str = "", user_message: str = ""
-    ) -> tuple[str, str] | None:
-        """按 QQ 命中与否构建身份提示词，返回 (提示词, 角色) 或 None(应跳过)。"""
-
-        slot = self._match_user(speaker_qq, current_group_id)
-        if slot is not None:
-            prompt = self._render_user_prompt(slot, speaker_qq, display_name, user_message)
-            role = "用户"
-        else:
-            if not bool(getattr(self.config.non_owner, "enable_non_owner_inject", False)):
-                return None
-            prompt = self._render_non_owner_prompt(speaker_qq, display_name, user_message)
-            role = "非用户"
-        if not prompt:
-            return None
-        return prompt, role
+    def _build_replyer_prompt(self, identity: VerifiedIdentity) -> str:
+        receipt = self._identity_receipt(identity)
+        replyer_prompt = self._render_replyer_prompt(identity)
+        if not replyer_prompt:
+            return receipt
+        return f"{receipt}\n\n【该身份回复便签】\n{replyer_prompt}"
 
     def _record_injection(
         self, stage: str, role: str, speaker_qq: str, display_name: str, is_private: bool, source: str
@@ -1027,7 +1001,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
             identity = self._verify_snapshot(snapshot)
             if identity is None:
                 return None
-            prompt = self._identity_receipt(identity)
+            prompt = self._build_replyer_prompt(identity)
             role = identity.relation
 
             # extra_prompt 由宿主拼进回复 prompt；保留已有内容再追加，避免覆盖其他插件。
@@ -1133,7 +1107,6 @@ class OwnerAuthPlugin(MaiBotPlugin):
                 f"- 插件启用：{bool(getattr(general, 'enabled', True))}",
                 f"- 生效用户槽位：{active}（已配置 QQ：{configured} 个）",
                 f"- 私聊注入：{bool(getattr(general, 'enable_private_inject', True))}",
-                f"- 非用户注入：{bool(getattr(self.config.non_owner, 'enable_non_owner_inject', False))}",
                 f"- 行动规划(planner)注入：{bool(getattr(general, 'enable_planner_inject', False))}",
                 f"- 机器人 QQ 已识别：{'是' if bot_qq else '否'}",
                 f"- 消息身份索引：{self._message_index_size()} 条 / {len(self._message_index)} 个会话",
@@ -1155,7 +1128,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
             self.ctx.logger.warning(f"[用户身份验证] 状态命令处理失败: {exc}")
             return False, f"status command failed: {exc}", 1
 
-    # ─── WebUI：拆分为「插件」「用户」「非用户」三个标签页 ──────
+    # ─── WebUI：拆分为「插件」「用户」两个标签页 ──────────────
 
     @staticmethod
     def _force_textarea_fields(sections: dict[str, Any]) -> None:
@@ -1255,9 +1228,6 @@ class OwnerAuthPlugin(MaiBotPlugin):
         plugin_tab_sections = [s for s in ("plugin",) if s in sections]
         # 「用户」页：仅前 N 个用户分区（多余的用户分区不引用 → 在页面中隐藏）。
         users_tab_sections = [f"user{i}" for i in range(1, active + 1) if f"user{i}" in sections]
-        # 「非用户」页。
-        non_owner_tab_sections = [s for s in ("non_owner",) if s in sections]
-
         tabs: list[dict[str, Any]] = []
         if plugin_tab_sections:
             tabs.append(
@@ -1266,10 +1236,6 @@ class OwnerAuthPlugin(MaiBotPlugin):
         if users_tab_sections:
             tabs.append(
                 {"id": "users", "title": "用户", "icon": "users", "order": 2, "sections": users_tab_sections}
-            )
-        if non_owner_tab_sections:
-            tabs.append(
-                {"id": "non_owner", "title": "非用户", "icon": "shield", "order": 3, "sections": non_owner_tab_sections}
             )
         if tabs:
             # Dashboard 按数组顺序渲染标签页、忽略 order 字段，故显式按 order 排序使顺序可控。
