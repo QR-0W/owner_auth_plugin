@@ -8,10 +8,10 @@
 把数字调小并保存后，超出的槽位配置会在插件重载时被清空（关「启用此用户」开关则只是临时停用）。
 
 实现要点：
-- 用官方 Hook：``chat.receive.after_process``（缓存最近真人发言者）、``maisaka.replyer.before_request``
+- 用官方 Hook：``chat.receive.after_process``（按消息号索引发言者）、``maisaka.replyer.before_request``
   （回复阶段经 extra_prompt 注入）、``maisaka.planner.before_request``（可选，行动规划阶段注入）。
-- 发言者 QQ 在注入时两级定位：``reply_message_id`` 精确取回 → 本插件缓存（收到消息时存下的那条触发消息）；
-  刻意不再用"会话最近消息"兜底——那在群聊里会把身份误判成别的发言者。
+- 发言者 QQ 在注入时两级定位：本插件 ``session_id + reply_message_id`` 精确索引 →
+  ``reply_message_id`` 精确取回；刻意不再用"会话最近发言者"兜底。
 - 身份判定只依据平台已验证的 QQ 号；提示词模板支持 {nickname}/{qq}/{display_name}/{msg} 等占位符，
   单遍替换不二次展开，发言者显示名与消息文本均做注入清洗。
 - 会话发言者缓存带 TTL（cache_ttl_seconds），超时清理，避免长期运行内存累积。
@@ -27,11 +27,14 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, ClassVar
+
 import re
 import time
 import tomllib
-from pathlib import Path
-from typing import Any, ClassVar
 
 from maibot_sdk import Command, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
@@ -95,6 +98,23 @@ _USER_COUNT_HINT = (
     "——槽位在加载时建模，改值不即时长框。调小并重载会清空超出部分的配置；仅临时停用某用户请用其「启用」开关。"
 )
 
+_MESSAGE_INDEX_LIMIT_PER_SESSION = 128
+
+
+@dataclass(frozen=True)
+class SenderSnapshot:
+    """入站消息中与身份认证有关的不可变发送者快照。"""
+
+    platform: str
+    session_id: str
+    message_id: str
+    speaker_qq: str
+    display_name: str
+    group_id: str
+    is_private: bool
+    processed_plain_text: str
+    cached_at: float
+
 
 # ─── 插件主体 ───────────────────────────────────────────────────
 
@@ -106,9 +126,9 @@ class OwnerAuthPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._bot_qq_account: str | None = None  # 机器人自身 QQ 缓存（懒加载，用于排除自身消息）
-        # 收到消息时按 session_id 缓存"最近一位真人发言者"（每会话一条，随活跃会话数有界，并按 TTL 清理）。
-        # 存的是精简后的 message dict，便于复用 _extract_identity 统一解析。
-        self._recent_by_session: dict[str, dict[str, Any]] = {}
+        # 每个会话按 message_id 保存发送者快照。上限大于默认上下文窗口，避免活跃上下文中的身份标签消失。
+        self._message_index: dict[str, OrderedDict[str, SenderSnapshot]] = {}
+        self._session_last_active: dict[str, float] = {}
         # 最近一次注入记录（仅保留全局最新一条 + 累计计数，供状态命令查看；天然有界）。
         self._last_injection: dict[str, Any] | None = None
         self._injection_count: int = 0
@@ -117,15 +137,16 @@ class OwnerAuthPlugin(MaiBotPlugin):
         )
 
     async def on_unload(self) -> None:
-        self._recent_by_session.clear()
+        self._message_index.clear()
+        self._session_last_active.clear()
         self._last_injection = None
         self.ctx.logger.info("[用户身份验证] 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         # 配置实时读取，无需缓存；此处仅作日志并顺手清一次过期缓存。scope=="self" 为本插件配置热重载。
         if scope == "self":
-            if hasattr(self, "_recent_by_session"):  # 防御：极早热重载时 on_load 可能尚未初始化字段
-                self._purge_recent_cache()
+            if hasattr(self, "_message_index"):  # 防御：极早热重载时 on_load 可能尚未初始化字段
+                self._purge_message_index()
             self.ctx.logger.info("[用户身份验证] 配置已更新")
 
     # ─── 旧版配置迁移 + 数量约束 ─────────────────────────────
@@ -458,7 +479,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
         return text[:40]
 
     @staticmethod
-    def _message_text(message: dict[str, Any]) -> str:
+    def _message_text(message: dict[str, Any] | SenderSnapshot) -> str:
         """取发言者本次消息文本（供 {msg}/{message} 占位符用）并做注入清洗，截断；空则返回空串。
 
         与 _sanitize_display 同口径：去花括号、把换行/制表/控制字符压成空格、合并空白；这样即便用户把
@@ -466,7 +487,11 @@ class OwnerAuthPlugin(MaiBotPlugin):
         （单遍 _safe_format 本就不会二次展开占位符，这里是额外收紧注入面。）
         """
 
-        text = message.get("processed_plain_text")
+        text = (
+            message.processed_plain_text
+            if isinstance(message, SenderSnapshot)
+            else message.get("processed_plain_text")
+        )
         if not isinstance(text, str):
             return ""
         cleaned = re.sub(r"[{}\r\n\t]", " ", text)  # 与 _sanitize_display 同一首遍：花括号/换行/制表→空格
@@ -501,73 +526,124 @@ class OwnerAuthPlugin(MaiBotPlugin):
         self._bot_qq_account = value
         return value
 
-    # ─── 缓存清理（TTL）─────────────────────────────────────
+    # ─── 消息身份索引 ────────────────────────────────────────
 
-    def _purge_recent_cache(self) -> None:
-        """清理超过 TTL 未活动的会话发言者缓存，避免长期运行内存累积。"""
+    def _purge_message_index(self) -> None:
+        """清理超过 TTL 未活动的整个会话索引，活跃会话内不按单条消息过期。"""
 
         ttl = self._cache_ttl()
         now = time.time()
-        stale = [
-            sid
-            for sid, cached in self._recent_by_session.items()
-            if isinstance(cached, dict) and now - float(cached.get("_cached_at") or 0) > ttl
-        ]
+        stale = [sid for sid, active_at in self._session_last_active.items() if now - active_at > ttl]
         for sid in stale:
-            self._recent_by_session.pop(sid, None)
+            self._message_index.pop(sid, None)
+            self._session_last_active.pop(sid, None)
 
-    # ─── 消息解析 ───────────────────────────────────────────
+    def _cache_sender_snapshot(self, snapshot: SenderSnapshot) -> None:
+        """按会话和消息号写入快照，并限制单会话索引大小。"""
 
-    async def _resolve_speaker_message(
-        self, session_id: str, reply_message_id: str
-    ) -> tuple[dict[str, Any] | None, str, str]:
-        """定位"机器人正在回复的发言者"消息，返回 (消息, 来源, 诊断)。两级定位：
+        session_messages = self._message_index.setdefault(snapshot.session_id, OrderedDict())
+        session_messages.pop(snapshot.message_id, None)
+        session_messages[snapshot.message_id] = snapshot
+        while len(session_messages) > _MESSAGE_INDEX_LIMIT_PER_SESSION:
+            session_messages.popitem(last=False)
+        self._session_last_active[snapshot.session_id] = snapshot.cached_at
 
-        1) 精确：用 reply_message_id 按消息号【全局】查（不按 chat_id 限定，避免 stream/session
-           维度不一致导致查不到）。
-        2) 会话缓存：收到消息时缓存的"本会话最近一位真人发言者"（来自 _RECEIVE_HOOK，不走在线查询，
-           即使该消息号不在可查消息库里也能命中；这是实际最常命中的一档）。
-        两者都拿不到则返回 (None, "none", 诊断)——刻意不再用"会话最近消息(get_recent)"兜底，因为它在
-        群聊里会把身份误判成"最近发的另一个人"；诊断串记录每步结果，便于在日志里定位原因。
-        """
+    def _get_cached_snapshot(self, session_id: str, message_id: str) -> SenderSnapshot | None:
+        """只按精确的会话和消息号读取快照，不做最近发言者回退。"""
 
-        diag: list[str] = []
-        if reply_message_id:
-            try:
-                res = await self.ctx.message.get_by_id(message_id=reply_message_id)
-                msg = res.get("message") if isinstance(res, dict) else None
-                if isinstance(msg, dict):
-                    return msg, "reply_id", ""
-                diag.append(f"by_id={'未找到' if isinstance(res, dict) else type(res).__name__}")
-            except Exception as exc:  # noqa: BLE001 - 取不到就走下一档，绝不影响回复
-                diag.append(f"by_id异常={exc}")
+        session_messages = self._message_index.get(session_id)
+        if session_messages is None:
+            return None
+        return session_messages.get(message_id)
 
-        if session_id:
-            cached = self._recent_by_session.get(session_id)
-            if isinstance(cached, dict):
-                return cached, "cache", ""
-            diag.append("cache未命中")
-
-        return None, "none", "; ".join(diag)
+    def _message_index_size(self) -> int:
+        return sum(len(messages) for messages in self._message_index.values())
 
     @classmethod
-    def _extract_identity(cls, message: dict[str, Any]) -> tuple[str, str, bool, str]:
-        """从消息体提取 (发言者QQ, 已清洗显示名, 是否私聊, 当前群号)。
-
-        当前群号：群聊取 group_info.group_id（纯数字，全 0/缺失视为空串）；私聊恒为空串。
-        """
+    def _snapshot_from_message(
+        cls,
+        message: dict[str, Any],
+        *,
+        fallback_session_id: str = "",
+        fallback_message_id: str = "",
+    ) -> SenderSnapshot | None:
+        """把 Host 消息字典转换为最小发送者快照。"""
 
         info = message.get("message_info") or {}
         user_info = info.get("user_info") or {}
         group_info = info.get("group_info")
-
-        speaker_qq = str(user_info.get("user_id") or "").strip()
+        platform = str(message.get("platform") or "qq").strip().lower()
+        session_id = str(message.get("session_id") or fallback_session_id).strip()
+        message_id = str(message.get("message_id") or fallback_message_id).strip()
+        speaker_qq = cls._norm_qq(user_info.get("user_id"))
+        if platform != "qq" or not session_id or not message_id or not speaker_qq:
+            return None
         display_name = cls._sanitize_display(
             user_info.get("user_cardname") or user_info.get("user_nickname") or ""
         )
-        is_private = group_info is None
         group_id = cls._norm_group(group_info.get("group_id")) if isinstance(group_info, dict) else ""
-        return speaker_qq, display_name, is_private, group_id
+        processed_plain_text = message.get("processed_plain_text")
+        return SenderSnapshot(
+            platform=platform,
+            session_id=session_id,
+            message_id=message_id,
+            speaker_qq=speaker_qq,
+            display_name=display_name,
+            group_id=group_id,
+            is_private=group_info is None,
+            processed_plain_text=processed_plain_text if isinstance(processed_plain_text, str) else "",
+            cached_at=time.time(),
+        )
+
+    # ─── 消息解析 ───────────────────────────────────────────
+
+    async def _resolve_speaker_snapshot(
+        self, session_id: str, reply_message_id: str
+    ) -> tuple[SenderSnapshot | None, str, str]:
+        """按精确消息号定位回复对象；索引和数据库都失败时直接跳过。"""
+
+        diag: list[str] = []
+        if not session_id:
+            diag.append("session为空")
+        if not reply_message_id:
+            diag.append("reply_id为空")
+            return None, "none", "; ".join(diag)
+
+        cached = self._get_cached_snapshot(session_id, reply_message_id) if session_id else None
+        if cached is not None:
+            return cached, "message_index", ""
+        diag.append("message_index未命中")
+
+        try:
+            res = await self.ctx.message.get_by_id(message_id=reply_message_id)
+            msg = res.get("message") if isinstance(res, dict) else None
+            if not isinstance(msg, dict):
+                diag.append(f"by_id={'未找到' if isinstance(res, dict) else type(res).__name__}")
+                return None, "none", "; ".join(diag)
+
+            explicit_session_id = str(msg.get("session_id") or "").strip()
+            if explicit_session_id and session_id and explicit_session_id != session_id:
+                diag.append("by_id会话不匹配")
+                return None, "none", "; ".join(diag)
+            explicit_message_id = str(msg.get("message_id") or "").strip()
+            if explicit_message_id and explicit_message_id != reply_message_id:
+                diag.append("by_id消息号不匹配")
+                return None, "none", "; ".join(diag)
+
+            snapshot = self._snapshot_from_message(
+                msg,
+                fallback_session_id=session_id,
+                fallback_message_id=reply_message_id,
+            )
+            if snapshot is None:
+                diag.append("by_id消息缺少身份字段")
+                return None, "none", "; ".join(diag)
+            self._cache_sender_snapshot(snapshot)
+            return snapshot, "reply_id", ""
+        except Exception as exc:  # noqa: BLE001 - 精确查询失败即跳过，绝不影响回复
+            diag.append(f"by_id异常={exc}")
+
+        return None, "none", "; ".join(diag)
 
     # ─── 提示词构建 ─────────────────────────────────────────
 
@@ -665,51 +741,31 @@ class OwnerAuthPlugin(MaiBotPlugin):
         else:
             emit(message)
 
-    # ─── 缓存钩子：收到消息时记录最近发言者 ──────────────────
+    # ─── 缓存钩子：收到消息时按消息号记录发言者 ──────────────
 
     @HookHandler(
         _RECEIVE_HOOK,
-        name="owner_auth_cache_speaker",
-        description="收到消息时缓存该会话最近一位真人发言者，供回复/规划阶段定位身份",
+        name="owner_auth_index_sender",
+        description="收到消息时按会话和消息号索引真人发言者，供回复/规划阶段精确定位身份",
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
         error_policy=ErrorPolicy.SKIP,  # 钩子调用失败（含宿主编码消息 OOM）一律跳过，不拖垮入站处理
     )
-    async def cache_recent_speaker(
+    async def index_sender_message(
         self, message: dict[str, Any] | None = None, **kwargs: Any
     ) -> None:
         # 只读观察：不改写消息、不中止链路（返回 None 直接放行）；异常一律吞掉但记 debug，绝不影响入站。
         try:
             if not isinstance(message, dict):
                 return None
-            info = message.get("message_info") or {}
-            user_info = info.get("user_info") or {}
-            speaker_qq = self._norm_qq(user_info.get("user_id"))
-            if not speaker_qq:
+            snapshot = self._snapshot_from_message(message)
+            if snapshot is None:
                 return None  # 拿不到发言者 QQ（系统/通知类消息）→ 不缓存
             bot_qq = await self._get_bot_qq()
-            if bot_qq and speaker_qq == bot_qq:
+            if bot_qq and snapshot.speaker_qq == bot_qq:
                 return None  # 机器人自己的消息不作为"发言者"
-            session_id = str(message.get("session_id") or "").strip()
-            if not session_id:
-                return None
-            # 存精简后的 message dict，便于 _resolve_speaker_message → _extract_identity 统一解析；
-            # 额外存 processed_plain_text 供 {msg} 占位符、_cached_at 供 TTL 清理。
-            self._recent_by_session[session_id] = {
-                "message_info": {
-                    "user_info": {
-                        "user_id": user_info.get("user_id"),
-                        "user_nickname": user_info.get("user_nickname"),
-                        "user_cardname": user_info.get("user_cardname"),
-                    },
-                    "group_info": info.get("group_info"),
-                },
-                "message_id": message.get("message_id"),
-                "timestamp": message.get("timestamp"),
-                "processed_plain_text": message.get("processed_plain_text"),
-                "_cached_at": time.time(),
-            }
-            self._purge_recent_cache()
+            self._cache_sender_snapshot(snapshot)
+            self._purge_message_index()
         except Exception as exc:  # noqa: BLE001 - 缓存失败不影响入站处理
             self.ctx.logger.debug(f"[用户身份验证] 缓存发言者失败（已忽略）: {exc}")
         return None
@@ -739,10 +795,10 @@ class OwnerAuthPlugin(MaiBotPlugin):
             reply_message_id = str(kwargs.get("reply_message_id") or "").strip()
             session_id = str(kwargs.get("session_id") or "").strip()
 
-            message, source, diag = await self._resolve_speaker_message(
+            snapshot, source, diag = await self._resolve_speaker_snapshot(
                 session_id, reply_message_id
             )
-            if not message:
+            if snapshot is None:
                 if log_on:
                     self.ctx.logger.info(
                         f"[用户身份验证] 未能定位发言者，跳过注入"
@@ -751,17 +807,16 @@ class OwnerAuthPlugin(MaiBotPlugin):
                     )
                 return None
 
-            speaker_qq, display_name, is_private, current_group_id = self._extract_identity(message)
-            if not speaker_qq:
-                if log_on:
-                    self.ctx.logger.info(f"[用户身份验证] 定位到消息但无 QQ，跳过（来源={source}）")
+            if snapshot.is_private and not bool(getattr(general_cfg, "enable_private_inject", True)):
                 return None
 
-            if is_private and not bool(getattr(general_cfg, "enable_private_inject", True)):
-                return None
-
-            user_message = self._message_text(message)
-            built = self._build_identity_prompt(speaker_qq, display_name, current_group_id, user_message)
+            user_message = self._message_text(snapshot)
+            built = self._build_identity_prompt(
+                snapshot.speaker_qq,
+                snapshot.display_name,
+                snapshot.group_id,
+                user_message,
+            )
             if built is None:
                 return None
             prompt, role = built
@@ -770,13 +825,20 @@ class OwnerAuthPlugin(MaiBotPlugin):
             existing = str(kwargs.get("extra_prompt") or "").strip()
             kwargs["extra_prompt"] = f"{existing}\n\n{prompt}".strip() if existing else prompt
 
-            self._record_injection("replyer", role, speaker_qq, display_name, is_private, source)
+            self._record_injection(
+                "replyer",
+                role,
+                snapshot.speaker_qq,
+                snapshot.display_name,
+                snapshot.is_private,
+                source,
+            )
             # 按「日志显示等级」输出（默认 INFO，普通日志即可见）；_log_inject 内部判 log_result 开关，
             # DEBUG 等级会额外把 prompt 全文打出。
             self._log_inject(
                 f"[用户身份验证] 已为{role}注入身份提示词："
-                f"QQ={self._mask_qq(speaker_qq)}, 名称={display_name or '未知'}, "
-                f"私聊={is_private}, 来源={source}",
+                f"QQ={self._mask_qq(snapshot.speaker_qq)}, 名称={snapshot.display_name or '未知'}, "
+                f"私聊={snapshot.is_private}, 来源={source}",
                 prompt,
             )
 
@@ -811,9 +873,9 @@ class OwnerAuthPlugin(MaiBotPlugin):
                 return None
 
             session_id = str(kwargs.get("session_id") or "").strip()
-            # planner 钩子无 reply_message_id，只按会话定位"最近发言者"。
-            message, source, diag = await self._resolve_speaker_message(session_id, "")
-            if not message:
+            # Planner 没有明确目标消息号；精确上下文标注由下一阶段实现，当前禁止最近发言者回退。
+            snapshot, source, diag = await self._resolve_speaker_snapshot(session_id, "")
+            if snapshot is None:
                 if bool(getattr(general_cfg, "log_result", True)):
                     self.ctx.logger.info(
                         f"[用户身份验证] planner 未能定位发言者，跳过注入"
@@ -821,23 +883,32 @@ class OwnerAuthPlugin(MaiBotPlugin):
                     )
                 return None
 
-            speaker_qq, display_name, is_private, current_group_id = self._extract_identity(message)
-            if not speaker_qq:
-                return None
-            if is_private and not bool(getattr(general_cfg, "enable_private_inject", True)):
+            if snapshot.is_private and not bool(getattr(general_cfg, "enable_private_inject", True)):
                 return None
 
-            user_message = self._message_text(message)
-            built = self._build_identity_prompt(speaker_qq, display_name, current_group_id, user_message)
+            user_message = self._message_text(snapshot)
+            built = self._build_identity_prompt(
+                snapshot.speaker_qq,
+                snapshot.display_name,
+                snapshot.group_id,
+                user_message,
+            )
             if built is None:
                 return None
             prompt, role = built
 
             self._inject_into_messages(messages, prompt)
-            self._record_injection("planner", role, speaker_qq, display_name, is_private, source)
+            self._record_injection(
+                "planner",
+                role,
+                snapshot.speaker_qq,
+                snapshot.display_name,
+                snapshot.is_private,
+                source,
+            )
             self._log_inject(
                 f"[用户身份验证] 已为{role}注入行动规划提示词："
-                f"QQ={self._mask_qq(speaker_qq)}, 来源={source}",
+                f"QQ={self._mask_qq(snapshot.speaker_qq)}, 来源={source}",
                 prompt,
             )
 
@@ -893,7 +964,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
                 f"- 非用户注入：{bool(getattr(self.config.non_owner, 'enable_non_owner_inject', False))}",
                 f"- 行动规划(planner)注入：{bool(getattr(general, 'enable_planner_inject', False))}",
                 f"- 机器人 QQ 已识别：{'是' if bot_qq else '否'}",
-                f"- 会话缓存数：{len(self._recent_by_session)}",
+                f"- 消息身份索引：{self._message_index_size()} 条 / {len(self._message_index)} 个会话",
                 f"- 累计注入次数：{self._injection_count}",
                 f"- 你的 QQ：{self._mask_qq(user_id)} → "
                 + (f"命中「{getattr(hit, 'nickname', '用户')}」" if hit is not None else "未命中（非用户）"),
