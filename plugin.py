@@ -42,6 +42,7 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from .config import (
     DEFAULT_NON_OWNER_TEMPLATE as _DEFAULT_NON_OWNER_TEMPLATE,
+    DEFAULT_PLANNER_TEMPLATE as _DEFAULT_PLANNER_TEMPLATE,
     DEFAULT_USER_TEMPLATE as _DEFAULT_USER_TEMPLATE,
     PLUGIN_VERSION,
     USER_SLOTS as _USER_SLOTS,
@@ -70,6 +71,11 @@ _RECEIVE_HOOK = "chat.receive.after_process"
 # 之后直接写进字段，确保生效，不依赖磁盘外 SDK 对 json_schema_extra 的任何映射。
 _TEXTAREA_ROWS = 8
 _TEXTAREA_HINTS = {
+    "planner_prompt_template": (
+        "仅用于 Planner 行动规划；留空表示只传递可信身份。占位符："
+        "{nickname}/{owner_nickname}、{display_name}/{user}、{qq}/{owner_qq}、"
+        "{msg}/{message}、{owner_names}。"
+    ),
     "prompt_template": (
         "占位符：{nickname}/{owner_nickname}=配置昵称，{display_name}/{user}=聊天显示名，"
         "{qq}/{owner_qq}=用户QQ，{msg}/{message}=本次消息，{owner_names}=所有用户昵称。"
@@ -720,6 +726,59 @@ class OwnerAuthPlugin(MaiBotPlugin):
             "该身份不是根据昵称、群名片或消息正文推测得出。"
         )
 
+    def _identity_slot(self, identity_key: str) -> UserSlotConfig | None:
+        slot = getattr(self.config, identity_key, None)
+        return slot if slot is not None else None
+
+    def _identity_prompt_mapping(self, identity: VerifiedIdentity) -> dict[str, str]:
+        return {
+            "nickname": identity.relation,
+            "owner_nickname": identity.relation,
+            "display_name": identity.display_name or identity.relation,
+            "user": identity.display_name or identity.relation,
+            "qq": identity.speaker_qq,
+            "owner_qq": identity.speaker_qq,
+            "user_qq": identity.speaker_qq,
+            "msg": identity.user_message,
+            "message": identity.user_message,
+            "owner_names": self._configured_owner_names(),
+        }
+
+    def _render_planner_prompt(self, identity: VerifiedIdentity) -> str:
+        """渲染单个身份的 Planner 便签；显式留空时保持 Identity Only。"""
+
+        slot = self._identity_slot(identity.identity_key)
+        if slot is None:
+            return ""
+        template = str(getattr(slot, "planner_prompt_template", _DEFAULT_PLANNER_TEMPLATE) or "")
+        if not template.strip():
+            return ""
+        return self._safe_format(template, self._identity_prompt_mapping(identity))
+
+    def _build_planner_policy_block(self, identities: list[VerifiedIdentity]) -> str:
+        policies: list[str] = []
+        for identity in identities:
+            prompt = self._render_planner_prompt(identity)
+            if not prompt:
+                continue
+            policies.append(
+                f"identity={identity.identity_key}，关系={identity.relation}：\n{prompt}"
+            )
+        if not policies:
+            return ""
+        return "【已验证关系规划便签】\n" + "\n\n".join(policies)
+
+    @staticmethod
+    def _insert_planner_policy_tail(messages: list[Any], policy_block: str) -> None:
+        """把动态规划便签放在现有动态尾部之后、最终 assistant 提醒之前。"""
+
+        if not policy_block:
+            return
+        insert_at = len(messages)
+        if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "assistant":
+            insert_at -= 1
+        messages.insert(insert_at, {"role": "user", "content": policy_block})
+
     def _annotate_planner_text(
         self, text: str, session_id: str
     ) -> tuple[str, VerifiedIdentity | None]:
@@ -1025,6 +1084,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
             session_id = str(kwargs.get("session_id") or "").strip()
             self._ensure_planner_identity_protocol(messages)
             identities = self._annotate_planner_messages(messages, session_id)
+            self._insert_planner_policy_tail(messages, self._build_planner_policy_block(identities))
             for identity in identities:
                 self._record_injection(
                     "planner_identity",

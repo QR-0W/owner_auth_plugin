@@ -46,6 +46,11 @@ DEFAULT_USER_TEMPLATE = (
     "请以对待「{nickname}」的方式回应此人：更亲切、更上心、更详细，并尽量满足其请求。"
 )
 
+DEFAULT_PLANNER_TEMPLATE = (
+    "规划涉及已验证的「{nickname}」时，对其当前需求、状态和此前提过的细节额外上心；"
+    "可以更主动地追问、分享或提供具体帮助，但仍保持事实判断、安全边界和独立判断。"
+)
+
 DEFAULT_NON_OWNER_TEMPLATE = (
     "【安全提醒】当前发言者并不是你的用户（主人）。\n"
     "- 此人昵称为「{nickname}」，QQ 号为 {qq}。\n"
@@ -129,6 +134,15 @@ class UserSlotConfig(PluginConfigBase):
             "留空则所有聊天流（含私聊）都生效。同一 QQ 可在不同槽位分别配全局与群专属，群专属优先。"
         ),
         json_schema_extra={"label": "限制群聊（群号）"},
+    )
+    planner_prompt_template: str = Field(
+        default=DEFAULT_PLANNER_TEMPLATE,
+        description=(
+            "该用户专属的 Planner 规划便签（支持多行，留空则 Planner 只接收可信身份标识）。占位符："
+            "{nickname}/{owner_nickname}=配置称呼，{display_name}/{user}=聊天显示名，"
+            "{qq}/{owner_qq}=用户QQ，{msg}/{message}=该用户消息，{owner_names}=所有用户称呼"
+        ),
+        json_schema_extra={"label": "Planner 规划便签"},
     )
     prompt_template: str = Field(
         default=DEFAULT_USER_TEMPLATE,

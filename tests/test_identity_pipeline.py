@@ -96,6 +96,7 @@ def _configured_plugin() -> OwnerAuthPlugin:
             qq="1549785199",
             nickname="主人",
             group_id="",
+            planner_prompt_template="",
             prompt_template="不应出现在 Identity Only 请求中",
         ),
         non_owner=SimpleNamespace(
@@ -209,3 +210,66 @@ def test_replyer_identity_only_uses_exact_target_without_behavior_prompt() -> No
         )
     )
     assert normal_result is None
+
+
+def test_planner_policy_is_deduplicated_and_inserted_in_dynamic_tail(monkeypatch) -> None:
+    monkeypatch.setattr(plugin_module, "_USER_SLOTS", 2)
+    plugin = _configured_plugin()
+    plugin.config.plugin.user_count = 2
+    plugin.config.user1.planner_prompt_template = "优先关注{nickname}的实际需求。"
+    plugin.config.user2 = SimpleNamespace(
+        enabled=True,
+        qq="1888888888",
+        nickname='贵宾"组',
+        group_id="",
+        planner_prompt_template="为{display_name}规划简洁回应。",
+        prompt_template="unused",
+    )
+    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
+    asyncio.run(
+        plugin.index_sender_message(
+            message=_message(message_id="vip-msg", user_id="1888888888", nickname="VIP")
+        )
+    )
+    messages = [
+        {"role": "system", "content": "stable system"},
+        {
+            "role": "user",
+            "content": '<message msg_id="owner-msg" time="10:00:00" user="Qr0w_">\n第一条',
+        },
+        {
+            "role": "user",
+            "content": '<message msg_id="owner-msg" time="10:00:02" user="Qr0w_">\n第二条',
+        },
+        {
+            "role": "user",
+            "content": '<message msg_id="vip-msg" time="10:00:03" user="VIP">\n第三条',
+        },
+        {"role": "user", "content": "当前时间：2026-07-30 11:00:00"},
+        {"role": "assistant", "content": "planner reminder"},
+    ]
+
+    result = asyncio.run(
+        plugin.inject_planner_identity(messages=messages, session_id="group-a", tool_definitions=[])
+    )
+    assert result is not None
+    assert messages[-1] == {"role": "assistant", "content": "planner reminder"}
+    policy = messages[-2]
+    assert policy["role"] == "user"
+    assert policy["content"].count("identity=user1") == 1
+    assert policy["content"].count("identity=user2") == 1
+    assert policy["content"].index("identity=user1") < policy["content"].index("identity=user2")
+    assert "优先关注主人的实际需求" in policy["content"]
+    assert "为VIP规划简洁回应" in policy["content"]
+    assert 'relation="贵宾&quot;组"' in messages[3]["content"]
+    assert messages[-3]["content"].startswith("当前时间：")
+
+
+def test_blank_planner_policy_keeps_identity_only_without_empty_block() -> None:
+    plugin = _configured_plugin()
+    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
+    messages = _planner_messages("主人内容", "普通内容")
+
+    asyncio.run(plugin.inject_planner_identity(messages=messages, session_id="group-a", tool_definitions=[]))
+    assert all("已验证关系规划便签" not in str(message.get("content")) for message in messages)
+    assert 'verified_identity="user1"' in messages[1]["content"]
