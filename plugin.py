@@ -1,7 +1,6 @@
 """用户身份验证插件（MaiBot 1.0 / maibot_sdk 2.x 重写版）
 
-在麦麦生成回复之前，按 QQ 号精确判断当前被回复的发言者是否为配置的用户（主人），
-并把对应的身份提示词注入到这一次回复的 prompt 中。
+按 QQ 号精确认证配置中的特殊用户，并分别向 Planner 和 Replyer 传递可信身份、规划便签与回复便签。
 
 设计：固定槽位 + 「用户数量控制」数字（配置模型见 config.py）。该数字 = 生成并显示的用户槽位
 个数（填 N 就生成 N 个），每个槽位各自独立 QQ / 昵称 / 限制群聊群号 / 多行模板 / 启用开关。
@@ -14,13 +13,12 @@
   ``reply_message_id`` 精确取回；刻意不再用"会话最近发言者"兜底。
 - 身份判定只依据平台已验证的 QQ 号；提示词模板支持 {nickname}/{qq}/{display_name}/{msg} 等占位符，
   单遍替换不二次展开，发言者显示名与消息文本均做注入清洗。
-- 会话发言者缓存带 TTL（cache_ttl_seconds），超时清理，避免长期运行内存累积。
+- 每个会话的消息身份索引有数量上限和不活跃 TTL，避免长期运行内存累积。
 - 「日志显示等级」可调（INFO/DEBUG/WARNING）；覆写 normalize_plugin_config 兼容旧版配置迁移。
-- 全程无平台相关代码，兼容 Linux 部署的麦麦。
+- 只处理 QQ 平台身份，不读取人物画像作为认证依据。
 
-配置布局：「插件」页（通用设置，含用户数量控制、日志等级、缓存有效期）、「用户」页（用户1~N，各自
-独立 QQ/昵称/限制群聊群号/多行模板）、「非用户」页。每个用户可填「限制群聊群号」：填了则该用户只在
-该群被认作用户，留空则所有聊天流（含私聊）都生效；同一 QQ 群专属优先于全局。
+配置布局：「插件」页（通用设置）和「用户」页（用户1~N，各自独立 QQ、关系称呼、限制群聊与两张便签）。
+群号留空时身份全局生效；同一 QQ 的群专属配置优先于全局配置。
 作者：风花叶（重构）
 许可：GPL-3.0-or-later
 """
@@ -60,7 +58,7 @@ _REPLYER_HOOK = "maisaka.replyer.before_request"
 _PLANNER_HOOK = "maisaka.planner.before_request"
 
 # 入站消息钩子；kwarg 名为 message(序列化的 SessionMessage dict，见 src/chat/message_receive/bot.py)。
-# 用于在收到消息时缓存"该会话最近一位真人发言者"。
+# 用于在收到消息时按 session_id + message_id 索引真人发送者。
 _RECEIVE_HOOK = "chat.receive.after_process"
 
 # 模板字段的多行文本框行数与字段下方小字提示(hint)。
@@ -86,8 +84,8 @@ _LOG_LEVEL_HINT = (
     "注入日志的输出等级（错误日志始终输出）。INFO＝普通日志可见；DEBUG＝另打印注入提示词全文（排障）；WARNING＝仅告警。"
 )
 
-# 「发言者缓存有效期(秒)」字段的下方小字提示。
-_CACHE_TTL_HINT = "会话发言者缓存的保留时长（秒），超时未活动即清理、防内存累积；默认 300 即可。"
+# 「身份索引会话有效期(秒)」字段的下方小字提示。
+_CACHE_TTL_HINT = "消息身份索引的会话不活跃清理时间；活跃会话内的单条消息不会中途掉标，默认 300 秒。"
 
 # 「限制群聊（群号）」字段的下方小字提示（每个用户分区都有该字段）。
 _GROUP_ID_HINT = (
@@ -159,6 +157,9 @@ class OwnerAuthPlugin(MaiBotPlugin):
         # 最近一次注入记录（仅保留全局最新一条 + 累计计数，供状态命令查看；天然有界）。
         self._last_injection: dict[str, Any] | None = None
         self._injection_count: int = 0
+        self._planner_identity_count: int = 0
+        self._replyer_verified_count: int = 0
+        self._fail_closed_count: int = 0
         self.ctx.logger.info(
             f"[用户身份验证] 插件 v{PLUGIN_VERSION} 已加载（钩子注入模式，已生成 {_USER_SLOTS} 个用户槽位）"
         )
@@ -990,6 +991,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
                 session_id, reply_message_id
             )
             if snapshot is None:
+                self._fail_closed_count += 1
                 if log_on:
                     self.ctx.logger.info(
                         f"[用户身份验证] 未能定位发言者，跳过注入"
@@ -1001,6 +1003,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
             identity = self._verify_snapshot(snapshot)
             if identity is None:
                 return None
+            self._replyer_verified_count += 1
             prompt = self._build_replyer_prompt(identity)
             role = identity.relation
 
@@ -1059,6 +1062,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
             self._ensure_planner_identity_protocol(messages)
             identities = self._annotate_planner_messages(messages, session_id)
             self._insert_planner_policy_tail(messages, self._build_planner_policy_block(identities))
+            self._planner_identity_count += len(identities)
             for identity in identities:
                 self._record_injection(
                     "planner_identity",
@@ -1110,6 +1114,9 @@ class OwnerAuthPlugin(MaiBotPlugin):
                 f"- 行动规划(planner)注入：{bool(getattr(general, 'enable_planner_inject', False))}",
                 f"- 机器人 QQ 已识别：{'是' if bot_qq else '否'}",
                 f"- 消息身份索引：{self._message_index_size()} 条 / {len(self._message_index)} 个会话",
+                f"- Planner 累计身份标注：{self._planner_identity_count}",
+                f"- Replyer 累计精确认证：{self._replyer_verified_count}",
+                f"- 身份定位失败关闭：{self._fail_closed_count}",
                 f"- 累计注入次数：{self._injection_count}",
                 f"- 你的 QQ：{self._mask_qq(user_id)} → "
                 + (f"命中「{getattr(hit, 'nickname', '用户')}」" if hit is not None else "未命中（非用户）"),

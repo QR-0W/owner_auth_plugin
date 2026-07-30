@@ -61,10 +61,17 @@ class FakeContext:
         self.logger = FakeLogger()
 
 
-def _message(*, message_id: str, user_id: str, nickname: str = "Qr0w_") -> dict:
+def _message(
+    *,
+    message_id: str,
+    user_id: str,
+    nickname: str = "Qr0w_",
+    session_id: str = "group-a",
+    group_id: str = "717566174",
+) -> dict:
     return {
         "platform": "qq",
-        "session_id": "group-a",
+        "session_id": session_id,
         "message_id": message_id,
         "processed_plain_text": "测试消息",
         "message_info": {
@@ -73,7 +80,7 @@ def _message(*, message_id: str, user_id: str, nickname: str = "Qr0w_") -> dict:
                 "user_nickname": nickname,
                 "user_cardname": "",
             },
-            "group_info": {"group_id": "717566174"},
+            "group_info": {"group_id": group_id} if group_id else None,
         },
     }
 
@@ -333,3 +340,82 @@ def test_legacy_prompt_migrates_only_to_replyer(monkeypatch) -> None:
     migrated_again, changed_again = plugin.normalize_plugin_config(migrated)
     assert changed_again is False
     assert migrated_again == migrated
+
+
+def test_group_specific_identity_wins_over_global_identity(monkeypatch) -> None:
+    monkeypatch.setattr(plugin_module, "_USER_SLOTS", 2)
+    plugin = _configured_plugin()
+    plugin.config.plugin.user_count = 2
+    plugin.config.user1.nickname = "全局主人"
+    plugin.config.user2 = SimpleNamespace(
+        enabled=True,
+        qq="1549785199",
+        nickname="群内身份",
+        group_id="717566174",
+        planner_prompt_template="",
+        replyer_prompt_template="",
+    )
+    snapshot = plugin._snapshot_from_message(_message(message_id="owner-msg", user_id="1549785199"))
+    assert snapshot is not None
+
+    identity = plugin._verify_snapshot(snapshot)
+    assert identity is not None
+    assert identity.identity_key == "user2"
+    assert identity.relation == "群内身份"
+
+
+def test_private_identity_can_be_disabled_without_fallback() -> None:
+    plugin = _configured_plugin()
+    plugin.config.plugin.enable_private_inject = False
+    private_message = _message(
+        message_id="private-msg",
+        user_id="1549785199",
+        session_id="private-a",
+        group_id="",
+    )
+    asyncio.run(plugin.index_sender_message(message=private_message))
+
+    result = asyncio.run(
+        plugin.inject_user_identity(
+            session_id="private-a",
+            reply_message_id="private-msg",
+            extra_prompt="",
+        )
+    )
+    assert result is None
+
+
+def test_planner_hook_output_round_trips_through_host_message_deserializer() -> None:
+    from src.plugin_runtime.hook_payloads import deserialize_prompt_messages
+
+    plugin = _configured_plugin()
+    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
+    messages = _planner_messages("主人内容", "普通内容")
+
+    result = asyncio.run(
+        plugin.inject_planner_identity(messages=messages, session_id="group-a", tool_definitions=[])
+    )
+    assert result is not None
+    deserialized = deserialize_prompt_messages(result["modified_kwargs"]["messages"])
+    assert plugin_module._PLANNER_IDENTITY_PROTOCOL in deserialized[0].content
+    assert 'verified_identity="user1" relation="主人"' in deserialized[1].content
+
+
+def test_unknown_planner_prefix_fails_closed_without_rewriting_content() -> None:
+    plugin = _configured_plugin()
+    content = "[msg_id:owner-msg][Qr0w_]旧格式消息"
+    annotated, identity = plugin._annotate_planner_text(content, "group-a")
+    assert identity is None
+    assert annotated == content
+
+
+def test_webui_schema_exposes_split_prompts_without_non_owner_section() -> None:
+    plugin = _configured_plugin()
+    schema = plugin.get_webui_config_schema()
+    sections = schema["sections"]
+    assert "non_owner" not in sections
+    assert "planner_prompt_template" in sections["user1"]["fields"]
+    assert "replyer_prompt_template" in sections["user1"]["fields"]
+    assert "prompt_template" not in sections["user1"]["fields"]
+    tabs = schema["layout"]["tabs"]
+    assert [tab["id"] for tab in tabs] == ["basic", "users"]

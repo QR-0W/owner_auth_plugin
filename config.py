@@ -74,8 +74,8 @@ class GeneralSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "私聊中注入"},
     )
     enable_planner_inject: bool = Field(
-        default=False,
-        description="实验性：除回复阶段外，是否同时把身份提示词注入到「行动规划(planner)」请求中（默认关；开启前建议先看日志确认命中正常）",
+        default=True,
+        description="是否把可信身份属性和非空规划便签注入行动规划（Planner）；关闭后只保留 Replyer 身份认证",
         json_schema_extra={"label": "同时注入行动规划(planner)"},
     )
     log_result: bool = Field(
@@ -90,8 +90,8 @@ class GeneralSectionConfig(PluginConfigBase):
     )
     cache_ttl_seconds: int = Field(
         default=300,
-        description="会话发言者缓存的有效期（秒）：超过该时长未活动的会话缓存会被清理，避免长期运行内存累积（10-3600）",
-        json_schema_extra={"label": "发言者缓存有效期(秒)", "min": 10, "max": 3600},
+        description="消息身份索引的会话不活跃清理时间（秒）；活跃会话中的单条消息不会按 TTL 中途掉标（10-3600）",
+        json_schema_extra={"label": "身份索引会话有效期(秒)", "min": 10, "max": 3600},
     )
     config_version: str = Field(
         default=PLUGIN_VERSION,
