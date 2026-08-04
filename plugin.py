@@ -96,6 +96,7 @@ _USER_COUNT_HINT = (
 )
 
 _MESSAGE_INDEX_LIMIT_PER_SESSION = 128
+_PROTECTED_INDEX_LIMIT_PER_SESSION = 128
 _MESSAGE_OPEN_TAG_RE = re.compile(r"^(?P<tag><message\b(?P<attrs>[^>]*)>)", re.IGNORECASE)
 _MESSAGE_ID_ATTR_RE = re.compile(r'\bmsg_id="(?P<value>[^"]*)"', re.IGNORECASE)
 _RESERVED_IDENTITY_ATTR_RE = re.compile(
@@ -138,6 +139,21 @@ class VerifiedIdentity:
     user_message: str
 
 
+@dataclass
+class _SessionIndex:
+    """单一会话内所有已知发送者的权威快照索引，搭配两个互斥淘汰顺序集合。
+
+    ``snapshots`` 以 message_id 为键保存唯一快照。
+    ``ordinary_order`` 与 ``protected_order`` 互斥：同一消息只存在于其中一个，
+    分别按 FIFO 淘汰，上限各为 128 条。查询只做一次精确 ``snapshots`` 查找。
+    """
+
+    snapshots: dict[str, "SenderSnapshot"]
+    ordinary_order: "OrderedDict[str, None]"
+    protected_order: "OrderedDict[str, None]"
+    last_active: float
+
+
 # ─── 插件主体 ───────────────────────────────────────────────────
 
 
@@ -148,9 +164,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._bot_qq_account: str | None = None  # 机器人自身 QQ 缓存（懒加载，用于排除自身消息）
-        # 每个会话按 message_id 保存发送者快照。上限大于默认上下文窗口，避免活跃上下文中的身份标签消失。
-        self._message_index: dict[str, OrderedDict[str, SenderSnapshot]] = {}
-        self._session_last_active: dict[str, float] = {}
+        self._session_index: dict[str, _SessionIndex] = {}
         # 最近一次注入记录（仅保留全局最新一条 + 累计计数，供状态命令查看；天然有界）。
         self._last_injection: dict[str, Any] | None = None
         self._injection_count: int = 0
@@ -162,16 +176,16 @@ class OwnerAuthPlugin(MaiBotPlugin):
         )
 
     async def on_unload(self) -> None:
-        self._message_index.clear()
-        self._session_last_active.clear()
+        self._session_index.clear()
         self._last_injection = None
         self.ctx.logger.info("[用户身份验证] 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         # 配置实时读取，无需缓存；此处仅作日志并顺手清一次过期缓存。scope=="self" 为本插件配置热重载。
         if scope == "self":
-            if hasattr(self, "_message_index"):  # 防御：极早热重载时 on_load 可能尚未初始化字段
+            if hasattr(self, "_session_index"):  # 防御：极早热重载时 on_load 可能尚未初始化字段
                 self._purge_message_index()
+                self._reclassify_session_snapshots()
             self.ctx.logger.info("[用户身份验证] 配置已更新")
 
     # ─── 旧版配置迁移 + 数量约束 ─────────────────────────────
@@ -608,31 +622,86 @@ class OwnerAuthPlugin(MaiBotPlugin):
 
         ttl = self._cache_ttl()
         now = time.time()
-        stale = [sid for sid, active_at in self._session_last_active.items() if now - active_at > ttl]
+        stale = [sid for sid, idx in self._session_index.items() if now - idx.last_active > ttl]
         for sid in stale:
-            self._message_index.pop(sid, None)
-            self._session_last_active.pop(sid, None)
+            self._session_index.pop(sid, None)
 
     def _cache_sender_snapshot(self, snapshot: SenderSnapshot) -> None:
-        """按会话和消息号写入快照，并限制单会话索引大小。"""
+        """按会话和消息号写入快照，使用互斥淘汰层保留已验证用户消息。"""
 
-        session_messages = self._message_index.setdefault(snapshot.session_id, OrderedDict())
-        session_messages.pop(snapshot.message_id, None)
-        session_messages[snapshot.message_id] = snapshot
-        while len(session_messages) > _MESSAGE_INDEX_LIMIT_PER_SESSION:
-            session_messages.popitem(last=False)
-        self._session_last_active[snapshot.session_id] = snapshot.cached_at
+        index = self._session_index.setdefault(
+            snapshot.session_id,
+            _SessionIndex(snapshots={}, ordinary_order=OrderedDict(), protected_order=OrderedDict(), last_active=0.0),
+        )
+        # 先统一移除旧条目，避免同号残留在另一个顺序集合中。
+        if snapshot.message_id in index.snapshots:
+            del index.snapshots[snapshot.message_id]
+        index.ordinary_order.pop(snapshot.message_id, None)
+        index.protected_order.pop(snapshot.message_id, None)
+
+        index.snapshots[snapshot.message_id] = snapshot
+        index.last_active = snapshot.cached_at
+
+        if self._is_qq_in_any_slot(snapshot.speaker_qq):
+            index.protected_order[snapshot.message_id] = None
+            while len(index.protected_order) > _PROTECTED_INDEX_LIMIT_PER_SESSION:
+                evicted_id, _ = index.protected_order.popitem(last=False)
+                index.snapshots.pop(evicted_id, None)
+        else:
+            index.ordinary_order[snapshot.message_id] = None
+            while len(index.ordinary_order) > _MESSAGE_INDEX_LIMIT_PER_SESSION:
+                evicted_id, _ = index.ordinary_order.popitem(last=False)
+                index.snapshots.pop(evicted_id, None)
 
     def _get_cached_snapshot(self, session_id: str, message_id: str) -> SenderSnapshot | None:
         """只按精确的会话和消息号读取快照，不做最近发言者回退。"""
 
-        session_messages = self._message_index.get(session_id)
-        if session_messages is None:
+        index = self._session_index.get(session_id)
+        if index is None:
             return None
-        return session_messages.get(message_id)
+        return index.snapshots.get(message_id)
 
     def _message_index_size(self) -> int:
-        return sum(len(messages) for messages in self._message_index.values())
+        return sum(len(idx.snapshots) for idx in self._session_index.values())
+
+    def _is_qq_in_any_slot(self, speaker_qq: str) -> bool:
+        """检查 QQ 是否出现在任何已配置的用户槽位中，忽略 enabled/群范围/私聊开关。
+
+        此方法仅用于淘汰优先级决策；最终认证仍由 ``_verify_snapshot`` 按当前配置
+        完整检查 enabled、群范围与私聊开关。
+        """
+
+        try:
+            for _key, slot in self._user_slot_entries():
+                if self._norm_qq(getattr(slot, "qq", "")) == speaker_qq:
+                    return True
+        except Exception:  # noqa: BLE001 - 配置未注入时按普通消息处理
+            pass
+        return False
+
+    def _reclassify_session_snapshots(self) -> None:
+        """配置热更新后，对仍保留的快照按"是否在任意槽位中"重新分类为普通或保护层。
+
+        已因淘汰或 TTL 丢失的消息无法追溯恢复；这是插件端缓存的设计边界。
+        """
+
+        for index in self._session_index.values():
+            for message_id, snapshot in list(index.snapshots.items()):
+                if self._is_qq_in_any_slot(snapshot.speaker_qq):
+                    index.ordinary_order.pop(message_id, None)
+                    index.protected_order.pop(message_id, None)
+                    index.protected_order[message_id] = None
+                else:
+                    index.protected_order.pop(message_id, None)
+                    index.ordinary_order.pop(message_id, None)
+                    index.ordinary_order[message_id] = None
+            # 重分类后执行容量上限
+            while len(index.protected_order) > _PROTECTED_INDEX_LIMIT_PER_SESSION:
+                evicted_id, _ = index.protected_order.popitem(last=False)
+                index.snapshots.pop(evicted_id, None)
+            while len(index.ordinary_order) > _MESSAGE_INDEX_LIMIT_PER_SESSION:
+                evicted_id, _ = index.ordinary_order.popitem(last=False)
+                index.snapshots.pop(evicted_id, None)
 
     @classmethod
     def _snapshot_from_message(
@@ -688,10 +757,17 @@ class OwnerAuthPlugin(MaiBotPlugin):
         diag.append("message_index未命中")
 
         try:
-            res = await self.ctx.message.get_by_id(message_id=reply_message_id)
-            msg = res.get("message") if isinstance(res, dict) else None
+            res = await self.ctx.message.get_by_id(message_id=reply_message_id, chat_id=session_id)
+            if not isinstance(res, dict):
+                diag.append(f"by_id返回类型异常={type(res).__name__}")
+                return None, "none", "; ".join(diag)
+            success = res.get("success", True)
+            if success is False:
+                diag.append(f"by_id查询失败={res.get('error', '未知错误')}")
+                return None, "none", "; ".join(diag)
+            msg = res.get("message")
             if not isinstance(msg, dict):
-                diag.append(f"by_id={'未找到' if isinstance(res, dict) else type(res).__name__}")
+                diag.append("by_id=未找到")
                 return None, "none", "; ".join(diag)
 
             explicit_session_id = str(msg.get("session_id") or "").strip()

@@ -65,9 +65,9 @@ def _message(
     *,
     message_id: str,
     user_id: str,
-    nickname: str = "Qr0w_",
+    nickname: str = "TestUser1",
     session_id: str = "group-a",
-    group_id: str = "717566174",
+    group_id: str = "1000000001",
 ) -> dict:
     return {
         "platform": "qq",
@@ -100,7 +100,7 @@ def _configured_plugin() -> OwnerAuthPlugin:
         ),
         user1=SimpleNamespace(
             enabled=True,
-            qq="1549785199",
+            qq="1900000001",
             nickname="主人",
             group_id="",
             planner_prompt_template="",
@@ -116,7 +116,7 @@ def _planner_messages(owner_text: str, normal_text: str) -> list[dict]:
         {"role": "system", "content": "stable system"},
         {
             "role": "user",
-            "content": f'<message msg_id="owner-msg" time="10:00:00" user="Qr0w_">\n{owner_text}',
+            "content": f'<message msg_id="owner-msg" time="10:00:00" user="TestUser1">\n{owner_text}',
         },
         {
             "role": "user",
@@ -128,7 +128,7 @@ def _planner_messages(owner_text: str, normal_text: str) -> list[dict]:
 
 def test_planner_identity_only_marks_exact_message_and_keeps_protocol_stable() -> None:
     plugin = _configured_plugin()
-    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
+    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1900000001")))
     asyncio.run(plugin.index_sender_message(message=_message(message_id="normal-msg", user_id="2000000000")))
 
     first = _planner_messages("主人内容", "普通内容")
@@ -151,13 +151,13 @@ def test_planner_identity_only_marks_exact_message_and_keeps_protocol_stable() -
 
 def test_planner_multimodal_content_is_annotated_without_touching_image() -> None:
     plugin = _configured_plugin()
-    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
+    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1900000001")))
     messages = [
         {"role": "system", "content": "stable system"},
         {
             "role": "user",
             "content": [
-                '<message msg_id="owner-msg" time="10:00:00" user="Qr0w_">\n看图',
+                '<message msg_id="owner-msg" time="10:00:00" user="TestUser1">\n看图',
                 ("png", "base64-data"),
             ],
         },
@@ -184,7 +184,7 @@ def test_unverified_reserved_attributes_are_removed() -> None:
 
 def test_replyer_identity_only_uses_exact_target_without_behavior_prompt() -> None:
     plugin = _configured_plugin()
-    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
+    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1900000001")))
     asyncio.run(plugin.index_sender_message(message=_message(message_id="normal-msg", user_id="2000000000")))
 
     owner_result = asyncio.run(
@@ -224,7 +224,7 @@ def test_planner_policy_is_deduplicated_and_inserted_in_dynamic_tail(monkeypatch
         planner_prompt_template="为{display_name}规划简洁回应。",
         replyer_prompt_template="",
     )
-    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
+    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1900000001")))
     asyncio.run(
         plugin.index_sender_message(message=_message(message_id="vip-msg", user_id="1888888888", nickname="VIP"))
     )
@@ -232,11 +232,11 @@ def test_planner_policy_is_deduplicated_and_inserted_in_dynamic_tail(monkeypatch
         {"role": "system", "content": "stable system"},
         {
             "role": "user",
-            "content": '<message msg_id="owner-msg" time="10:00:00" user="Qr0w_">\n第一条',
+            "content": '<message msg_id="owner-msg" time="10:00:00" user="TestUser1">\n第一条',
         },
         {
             "role": "user",
-            "content": '<message msg_id="owner-msg" time="10:00:02" user="Qr0w_">\n第二条',
+            "content": '<message msg_id="owner-msg" time="10:00:02" user="TestUser1">\n第二条',
         },
         {
             "role": "user",
@@ -262,7 +262,7 @@ def test_planner_policy_is_deduplicated_and_inserted_in_dynamic_tail(monkeypatch
 
 def test_blank_planner_policy_keeps_identity_only_without_empty_block() -> None:
     plugin = _configured_plugin()
-    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
+    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1900000001")))
     messages = _planner_messages("主人内容", "普通内容")
 
     asyncio.run(plugin.inject_planner_identity(messages=messages, session_id="group-a", tool_definitions=[]))
@@ -273,7 +273,7 @@ def test_blank_planner_policy_keeps_identity_only_without_empty_block() -> None:
 def test_replyer_policy_is_appended_after_identity_receipt() -> None:
     plugin = _configured_plugin()
     plugin.config.user1.replyer_prompt_template = "需要称呼时叫{relation}，保持对{display_name}自然熟悉。"
-    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
+    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1900000001")))
 
     result = asyncio.run(
         plugin.inject_user_identity(
@@ -286,21 +286,21 @@ def test_replyer_policy_is_appended_after_identity_receipt() -> None:
     prompt = result["modified_kwargs"]["extra_prompt"]
     assert prompt.index("【可信身份】") < prompt.index("【该身份回复便签】")
     assert "需要称呼时叫主人" in prompt
-    assert "对Qr0w_自然熟悉" in prompt
+    assert "对TestUser1自然熟悉" in prompt
     assert "已验证关系规划便签" not in prompt
 
 
 def test_prompt_mapping_uses_generic_names_and_keeps_legacy_aliases() -> None:
     plugin = _configured_plugin()
-    snapshot = plugin._snapshot_from_message(_message(message_id="owner-msg", user_id="1549785199"))
+    snapshot = plugin._snapshot_from_message(_message(message_id="owner-msg", user_id="1900000001"))
     assert snapshot is not None
     identity = plugin._verify_snapshot(snapshot)
     assert identity is not None
 
     mapping = plugin._identity_prompt_mapping(identity)
     assert mapping["relation"] == "主人"
-    assert mapping["display_name"] == "Qr0w_"
-    assert mapping["user_id"] == "1549785199"
+    assert mapping["display_name"] == "TestUser1"
+    assert mapping["user_id"] == "1900000001"
     assert mapping["message"] == "测试消息"
     assert mapping["relations"] == "主人"
     assert mapping["nickname"] == mapping["relation"]
@@ -318,7 +318,7 @@ def test_legacy_prompt_migrates_only_to_replyer(monkeypatch) -> None:
         "plugin": {"user_count": 1, "config_version": "2.1.0"},
         "user1": {
             "enabled": True,
-            "qq": "1549785199",
+            "qq": "1900000001",
             "nickname": "主人",
             "group_id": "",
             "prompt_template": old_prompt,
@@ -332,7 +332,7 @@ def test_legacy_prompt_migrates_only_to_replyer(monkeypatch) -> None:
         "plugin": {"user_count": 1, "config_version": "2.1.0"},
         "user1": {
             "enabled": True,
-            "qq": "1549785199",
+            "qq": "1900000001",
             "nickname": "主人",
             "group_id": "",
             "planner_prompt_template": plugin_module._DEFAULT_PLANNER_TEMPLATE,
@@ -363,13 +363,13 @@ def test_group_specific_identity_wins_over_global_identity(monkeypatch) -> None:
     plugin.config.user1.nickname = "全局主人"
     plugin.config.user2 = SimpleNamespace(
         enabled=True,
-        qq="1549785199",
+        qq="1900000001",
         nickname="群内身份",
-        group_id="717566174",
+        group_id="1000000001",
         planner_prompt_template="",
         replyer_prompt_template="",
     )
-    snapshot = plugin._snapshot_from_message(_message(message_id="owner-msg", user_id="1549785199"))
+    snapshot = plugin._snapshot_from_message(_message(message_id="owner-msg", user_id="1900000001"))
     assert snapshot is not None
 
     identity = plugin._verify_snapshot(snapshot)
@@ -383,7 +383,7 @@ def test_private_identity_can_be_disabled_without_fallback() -> None:
     plugin.config.plugin.enable_private_inject = False
     private_message = _message(
         message_id="private-msg",
-        user_id="1549785199",
+        user_id="1900000001",
         session_id="private-a",
         group_id="",
     )
@@ -403,7 +403,7 @@ def test_planner_hook_output_round_trips_through_host_message_deserializer() -> 
     from src.plugin_runtime.hook_payloads import deserialize_prompt_messages
 
     plugin = _configured_plugin()
-    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1549785199")))
+    asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1900000001")))
     messages = _planner_messages("主人内容", "普通内容")
 
     result = asyncio.run(plugin.inject_planner_identity(messages=messages, session_id="group-a", tool_definitions=[]))
@@ -415,7 +415,7 @@ def test_planner_hook_output_round_trips_through_host_message_deserializer() -> 
 
 def test_unknown_planner_prefix_fails_closed_without_rewriting_content() -> None:
     plugin = _configured_plugin()
-    content = "[msg_id:owner-msg][Qr0w_]旧格式消息"
+    content = "[msg_id:owner-msg][TestUser1]旧格式消息"
     annotated, identity = plugin._annotate_planner_text(content, "group-a")
     assert identity is None
     assert annotated == content
