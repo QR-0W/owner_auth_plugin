@@ -27,9 +27,11 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime
 from html import escape, unescape
 from pathlib import Path
 from typing import Any, ClassVar
+from uuid import uuid4
 
 import re
 import time
@@ -854,15 +856,26 @@ class OwnerAuthPlugin(MaiBotPlugin):
         return "【已验证关系规划便签】\n" + "\n\n".join(policies)
 
     @staticmethod
-    def _insert_planner_policy_tail(messages: list[Any], policy_block: str) -> None:
-        """把动态规划便签放在现有动态尾部之后、最终 assistant 提醒之前。"""
+    def _planner_item(item_type: str, text: str) -> dict[str, Any]:
+        return {
+            "item_type": item_type,
+            "meta": {
+                "item_id": uuid4().hex,
+                "logical_turn_id": None,
+                "timestamp": datetime.now().isoformat(),
+            },
+            "parts": [{"type": "text", "text": text}],
+        }
 
+    @classmethod
+    def _insert_planner_policy_tail(cls, items: list[Any], policy_block: str) -> None:
+        """把动态规划便签放在现有动态尾部之后、最终 assistant 提醒之前。"""
         if not policy_block:
             return
-        insert_at = len(messages)
-        if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "assistant":
+        insert_at = len(items)
+        if items and items[-1]["item_type"] == "AssistantMessageItem":
             insert_at -= 1
-        messages.insert(insert_at, {"role": "user", "content": policy_block})
+        items.insert(insert_at, cls._planner_item("UserMessageItem", policy_block))
 
     def _annotate_planner_text(self, text: str, session_id: str) -> tuple[str, VerifiedIdentity | None]:
         """在单条 Planner 文本的 message 开始标签中写入可信身份属性。"""
@@ -892,56 +905,30 @@ class OwnerAuthPlugin(MaiBotPlugin):
         rebuilt_tag = f"<message{f' {clean_attrs}' if clean_attrs else ''}{identity_attrs}>"
         return f"{rebuilt_tag}{text[match.end() :]}", identity
 
-    def _annotate_planner_content(self, content: Any, session_id: str) -> tuple[Any, VerifiedIdentity | None]:
-        """标注字符串或多模态 content 中的首个 Planner 消息文本片段。"""
-
-        if isinstance(content, str):
-            return self._annotate_planner_text(content, session_id)
-        if not isinstance(content, list):
-            return content, None
-        updated = list(content)
-        for index, item in enumerate(updated):
-            if not isinstance(item, str):
-                continue
-            annotated, identity = self._annotate_planner_text(item, session_id)
-            if annotated != item:
-                updated[index] = annotated
-            if identity is not None:
-                return updated, identity
-        return updated if updated != content else content, None
-
-    def _annotate_planner_messages(self, messages: list[Any], session_id: str) -> list[VerifiedIdentity]:
-        """标注本次 Planner 消息副本，并按槽位键去重返回命中的身份。"""
-
+    def _annotate_planner_items(self, items: list[Any], session_id: str) -> list[VerifiedIdentity]:
+        """只标注用户 Item 的文本片段，不改图片、工具调用或推理项。"""
         identities: dict[str, VerifiedIdentity] = {}
-        for message in messages:
-            if not isinstance(message, dict):
+        for item in items:
+            if item["item_type"] != "UserMessageItem":
                 continue
-            original_content = message.get("content")
-            annotated, identity = self._annotate_planner_content(original_content, session_id)
-            if annotated != original_content:
-                message["content"] = annotated
-            if identity is not None:
-                identities.setdefault(identity.identity_key, identity)
-        return sorted(identities.values(), key=lambda item: int(item.identity_key.removeprefix("user") or 0))
+            for part in item["parts"]:
+                if part["type"] != "text":
+                    continue
+                part["text"], identity = self._annotate_planner_text(part["text"], session_id)
+                if identity is not None:
+                    identities.setdefault(identity.identity_key, identity)
+        return sorted(identities.values(), key=lambda item: int(item.identity_key.removeprefix("user")))
 
-    @staticmethod
-    def _ensure_planner_identity_protocol(messages: list[Any]) -> None:
+    @classmethod
+    def _ensure_planner_identity_protocol(cls, items: list[Any]) -> None:
         """把固定身份字段协议稳定地追加到 Planner system 尾部一次。"""
-
-        for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "system":
+        for item in items:
+            if item["item_type"] != "SystemMessageItem":
                 continue
-            content = message.get("content")
-            if isinstance(content, str):
-                if _PLANNER_IDENTITY_PROTOCOL not in content:
-                    message["content"] = f"{content}\n\n{_PLANNER_IDENTITY_PROTOCOL}".strip()
-                return
-            if isinstance(content, list):
-                if _PLANNER_IDENTITY_PROTOCOL not in content:
-                    content.append(_PLANNER_IDENTITY_PROTOCOL)
-                return
-        messages.insert(0, {"role": "system", "content": _PLANNER_IDENTITY_PROTOCOL})
+            if not any(part.get("text", "").endswith(_PLANNER_IDENTITY_PROTOCOL) for part in item["parts"]):
+                item["parts"].append({"type": "text", "text": _PLANNER_IDENTITY_PROTOCOL})
+            return
+        items.insert(0, cls._planner_item("SystemMessageItem", _PLANNER_IDENTITY_PROTOCOL))
 
     def _render_replyer_prompt(self, identity: VerifiedIdentity) -> str:
         """渲染单个身份的 Replyer 便签；显式留空时保持 Identity Only。"""
@@ -1106,21 +1093,21 @@ class OwnerAuthPlugin(MaiBotPlugin):
     async def inject_planner_identity(self, **kwargs: Any) -> dict[str, Any] | None:
         try:
             general_cfg = self.config.plugin
-            if not bool(getattr(general_cfg, "enabled", True)):
+            if not general_cfg.enabled:
                 return None
-            if not bool(getattr(general_cfg, "enable_planner_inject", False)):
+            if not general_cfg.enable_planner_inject:
                 return None  # 默认关，需在「插件」页显式开启
             if not self._has_configured_user():
                 return None
 
-            messages = kwargs.get("messages")
-            if not isinstance(messages, list) or not messages:
+            items = kwargs["items"]
+            if not items:
                 return None
 
             session_id = str(kwargs.get("session_id") or "").strip()
-            self._ensure_planner_identity_protocol(messages)
-            identities = self._annotate_planner_messages(messages, session_id)
-            self._insert_planner_policy_tail(messages, self._build_planner_policy_block(identities))
+            self._ensure_planner_identity_protocol(items)
+            identities = self._annotate_planner_items(items, session_id)
+            self._insert_planner_policy_tail(items, self._build_planner_policy_block(identities))
             self._planner_identity_count += len(identities)
             for identity in identities:
                 self._record_injection(
@@ -1137,7 +1124,7 @@ class OwnerAuthPlugin(MaiBotPlugin):
                     + "、".join(identity.relation for identity in identities)
                 )
 
-            # messages 已原地改；modified_kwargs 整体替换，返回完整 kwargs。
+            # items 已原地改；modified_kwargs 整体替换，返回完整 kwargs。
             return {"action": "continue", "modified_kwargs": kwargs}
         except Exception as exc:  # noqa: BLE001 - 注入失败绝不能影响规划
             self.ctx.logger.error(f"[用户身份验证] planner 注入出错，已跳过: {exc}", exc_info=True)

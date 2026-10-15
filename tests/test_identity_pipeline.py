@@ -111,18 +111,31 @@ def _configured_plugin() -> OwnerAuthPlugin:
     return plugin
 
 
+def _item(role, content):
+    item_type = {"system": "SystemMessageItem", "user": "UserMessageItem", "assistant": "AssistantMessageItem"}[role]
+    contents = content if isinstance(content, list) else [content]
+    parts = [
+        {"type": "text", "text": value} if isinstance(value, str)
+        else {"type": "image", "image_format": value[0], "image_base64": value[1]}
+        for value in contents
+    ]
+    return {
+        "item_type": item_type,
+        "meta": {"item_id": str(content), "logical_turn_id": None, "timestamp": "2026-10-15T10:00:00"},
+        "parts": parts,
+    }
+
+
+def _text(item):
+    return "\n".join(part["text"] for part in item["parts"] if part["type"] == "text")
+
+
 def _planner_messages(owner_text: str, normal_text: str) -> list[dict]:
     return [
-        {"role": "system", "content": "stable system"},
-        {
-            "role": "user",
-            "content": f'<message msg_id="owner-msg" time="10:00:00" user="TestUser1">\n{owner_text}',
-        },
-        {
-            "role": "user",
-            "content": f'<message msg_id="normal-msg" time="10:00:01" user="Other">\n{normal_text}',
-        },
-        {"role": "assistant", "content": "planner reminder"},
+        _item("system", "stable system"),
+        _item("user", f'<message msg_id="owner-msg" time="10:00:00" user="TestUser1">\n{owner_text}'),
+        _item("user", f'<message msg_id="normal-msg" time="10:00:01" user="Other">\n{normal_text}'),
+        _item("assistant", "planner reminder"),
     ]
 
 
@@ -134,18 +147,18 @@ def test_planner_identity_only_marks_exact_message_and_keeps_protocol_stable() -
     first = _planner_messages("主人内容", "普通内容")
     second = _planner_messages("主人内容", "普通内容")
     first_result = asyncio.run(
-        plugin.inject_planner_identity(messages=first, session_id="group-a", tool_definitions=[])
+        plugin.inject_planner_identity(items=first, session_id="group-a", tool_definitions=[])
     )
     second_result = asyncio.run(
-        plugin.inject_planner_identity(messages=second, session_id="group-a", tool_definitions=[])
+        plugin.inject_planner_identity(items=second, session_id="group-a", tool_definitions=[])
     )
 
     assert first_result is not None and second_result is not None
     assert first == second
-    assert plugin_module._PLANNER_IDENTITY_PROTOCOL in first[0]["content"]
-    assert 'verified_identity="user1" relation="主人"' in first[1]["content"]
-    assert "verified_identity" not in first[2]["content"]
-    rendered = "\n".join(str(message["content"]) for message in first)
+    assert plugin_module._PLANNER_IDENTITY_PROTOCOL in _text(first[0])
+    assert 'verified_identity="user1" relation="主人"' in _text(first[1])
+    assert "verified_identity" not in _text(first[2])
+    rendered = "\n".join(str(_text(message)) for message in first)
     assert "该身份回复便签" not in rendered
 
 
@@ -153,20 +166,17 @@ def test_planner_multimodal_content_is_annotated_without_touching_image() -> Non
     plugin = _configured_plugin()
     asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1900000001")))
     messages = [
-        {"role": "system", "content": "stable system"},
-        {
-            "role": "user",
-            "content": [
+        _item("system", "stable system"),
+        _item("user", [
                 '<message msg_id="owner-msg" time="10:00:00" user="TestUser1">\n看图',
                 ("png", "base64-data"),
-            ],
-        },
+            ]),
     ]
 
-    result = asyncio.run(plugin.inject_planner_identity(messages=messages, session_id="group-a", tool_definitions=[]))
+    result = asyncio.run(plugin.inject_planner_identity(items=messages, session_id="group-a", tool_definitions=[]))
     assert result is not None
-    assert 'verified_identity="user1" relation="主人"' in messages[1]["content"][0]
-    assert messages[1]["content"][1] == ("png", "base64-data")
+    assert 'verified_identity="user1" relation="主人"' in messages[1]["parts"][0]["text"]
+    assert messages[1]["parts"][1] == {"type": "image", "image_format": "png", "image_base64": "base64-data"}
 
 
 def test_unverified_reserved_attributes_are_removed() -> None:
@@ -229,35 +239,26 @@ def test_planner_policy_is_deduplicated_and_inserted_in_dynamic_tail(monkeypatch
         plugin.index_sender_message(message=_message(message_id="vip-msg", user_id="1888888888", nickname="VIP"))
     )
     messages = [
-        {"role": "system", "content": "stable system"},
-        {
-            "role": "user",
-            "content": '<message msg_id="owner-msg" time="10:00:00" user="TestUser1">\n第一条',
-        },
-        {
-            "role": "user",
-            "content": '<message msg_id="owner-msg" time="10:00:02" user="TestUser1">\n第二条',
-        },
-        {
-            "role": "user",
-            "content": '<message msg_id="vip-msg" time="10:00:03" user="VIP">\n第三条',
-        },
-        {"role": "user", "content": "当前时间：2026-07-30 11:00:00"},
-        {"role": "assistant", "content": "planner reminder"},
+        _item("system", "stable system"),
+        _item("user", '<message msg_id="owner-msg" time="10:00:00" user="TestUser1">\n第一条'),
+        _item("user", '<message msg_id="owner-msg" time="10:00:02" user="TestUser1">\n第二条'),
+        _item("user", '<message msg_id="vip-msg" time="10:00:03" user="VIP">\n第三条'),
+        _item("user", "当前时间：2026-07-30 11:00:00"),
+        _item("assistant", "planner reminder"),
     ]
 
-    result = asyncio.run(plugin.inject_planner_identity(messages=messages, session_id="group-a", tool_definitions=[]))
+    result = asyncio.run(plugin.inject_planner_identity(items=messages, session_id="group-a", tool_definitions=[]))
     assert result is not None
-    assert messages[-1] == {"role": "assistant", "content": "planner reminder"}
+    assert messages[-1] == _item("assistant", "planner reminder")
     policy = messages[-2]
-    assert policy["role"] == "user"
-    assert policy["content"].count("identity=user1") == 1
-    assert policy["content"].count("identity=user2") == 1
-    assert policy["content"].index("identity=user1") < policy["content"].index("identity=user2")
-    assert "优先关注主人的实际需求" in policy["content"]
-    assert "为VIP规划简洁回应" in policy["content"]
-    assert 'relation="贵宾&quot;组"' in messages[3]["content"]
-    assert messages[-3]["content"].startswith("当前时间：")
+    assert policy["item_type"] == "UserMessageItem"
+    assert _text(policy).count("identity=user1") == 1
+    assert _text(policy).count("identity=user2") == 1
+    assert _text(policy).index("identity=user1") < _text(policy).index("identity=user2")
+    assert "优先关注主人的实际需求" in _text(policy)
+    assert "为VIP规划简洁回应" in _text(policy)
+    assert 'relation="贵宾&quot;组"' in _text(messages[3])
+    assert _text(messages[-3]).startswith("当前时间：")
 
 
 def test_blank_planner_policy_keeps_identity_only_without_empty_block() -> None:
@@ -265,9 +266,9 @@ def test_blank_planner_policy_keeps_identity_only_without_empty_block() -> None:
     asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1900000001")))
     messages = _planner_messages("主人内容", "普通内容")
 
-    asyncio.run(plugin.inject_planner_identity(messages=messages, session_id="group-a", tool_definitions=[]))
-    assert all("已验证关系规划便签" not in str(message.get("content")) for message in messages)
-    assert 'verified_identity="user1"' in messages[1]["content"]
+    asyncio.run(plugin.inject_planner_identity(items=messages, session_id="group-a", tool_definitions=[]))
+    assert all("已验证关系规划便签" not in _text(message) for message in messages)
+    assert 'verified_identity="user1"' in _text(messages[1])
 
 
 def test_replyer_policy_is_appended_after_identity_receipt() -> None:
@@ -348,7 +349,7 @@ def test_legacy_prompt_migrates_only_to_replyer(monkeypatch) -> None:
     assert migrated["user1"]["planner_prompt_template"] == plugin_module._DEFAULT_PLANNER_TEMPLATE
     assert "prompt_template" not in migrated["user1"]
     assert "non_owner" not in migrated
-    assert migrated["plugin"]["config_version"] == "2.2.1"
+    assert migrated["plugin"]["config_version"] == "2.2.2"
     assert any("已迁入 Replyer 回复便签" in message for message in plugin.ctx.logger.messages)
 
     migrated_again, changed_again = plugin.normalize_plugin_config(migrated)
@@ -400,17 +401,17 @@ def test_private_identity_can_be_disabled_without_fallback() -> None:
 
 
 def test_planner_hook_output_round_trips_through_host_message_deserializer() -> None:
-    from src.plugin_runtime.hook_payloads import deserialize_prompt_messages
+    from src.plugin_runtime.hook_payloads import deserialize_prompt_items
 
     plugin = _configured_plugin()
     asyncio.run(plugin.index_sender_message(message=_message(message_id="owner-msg", user_id="1900000001")))
     messages = _planner_messages("主人内容", "普通内容")
 
-    result = asyncio.run(plugin.inject_planner_identity(messages=messages, session_id="group-a", tool_definitions=[]))
+    result = asyncio.run(plugin.inject_planner_identity(items=messages, session_id="group-a", tool_definitions=[]))
     assert result is not None
-    deserialized = deserialize_prompt_messages(result["modified_kwargs"]["messages"])
-    assert plugin_module._PLANNER_IDENTITY_PROTOCOL in deserialized[0].content
-    assert 'verified_identity="user1" relation="主人"' in deserialized[1].content
+    deserialized = deserialize_prompt_items(result["modified_kwargs"]["items"])
+    assert plugin_module._PLANNER_IDENTITY_PROTOCOL in "\n".join(part.text for part in deserialized[0].parts)
+    assert 'verified_identity="user1" relation="主人"' in deserialized[1].parts[0].text
 
 
 def test_unknown_planner_prefix_fails_closed_without_rewriting_content() -> None:

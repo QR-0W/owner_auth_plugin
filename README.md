@@ -131,7 +131,7 @@ MaiBot 会按 `platform + user_id` 选择相关人物画像并作为 Planner 内
 
 ## 兼容性
 
-- MaiBot：`1.0.0` 到 `1.99.x`
+- MaiBot：`1.3.4` 到 `1.99.x`（当前钩子使用 Context Items；已在 1.3.8 验证）
 - maibot_sdk：`2.0.0` 到 `2.99.x`
 - Python：跟随 MaiBot 运行环境
 - 第三方依赖：无

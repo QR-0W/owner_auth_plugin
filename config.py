@@ -16,7 +16,7 @@ from maibot_sdk import PluginConfigBase
 from pydantic import Field, create_model
 
 # 插件 / 配置版本号（plugin.py、_manifest.json 与本文件保持一致）。
-PLUGIN_VERSION = "2.2.1"
+PLUGIN_VERSION = "2.2.2"
 
 # 生成的用户槽位数 USER_SLOTS = 已保存的 user_count —— 不写死上限、也不留多余空槽位
 # （config.toml 里有几个用户就几个 [userN] 表，干净）。固定槽位（每用户独立多行模板、非动态列表）天生
