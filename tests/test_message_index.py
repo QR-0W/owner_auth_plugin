@@ -8,6 +8,8 @@ import sys
 import time
 import types
 
+from maibot_sdk.context import PluginContext
+
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "owner_auth_plugin_testpkg"
@@ -56,12 +58,9 @@ class FakeMessageApi:
         self.responses: dict[str, dict] = {}
         self.queries: list[str] = []
 
-    async def get_by_id(self, message_id: str, **kwargs: Any) -> dict[str, Any]:
+    async def get_by_id(self, message_id: str, **kwargs: Any) -> dict[str, Any] | None:
         self.queries.append(message_id)
-        raw = self.responses.get(message_id)
-        if isinstance(raw, dict) and "success" in raw:
-            return raw
-        return {"success": True, "message": raw} if isinstance(raw, dict) else {"success": True, "message": None}
+        return PluginContext._normalize_capability_result("message.get_by_id", self.responses.get(message_id))
 
 
 class FakeContext:
@@ -99,6 +98,7 @@ def _plugin() -> tuple[OwnerAuthPlugin, FakeContext]:
     plugin = OwnerAuthPlugin()
     context = FakeContext()
     plugin._ctx = context
+    plugin.set_plugin_config(plugin.get_default_config())
     asyncio.run(plugin.on_load())
     return plugin, context
 
@@ -211,8 +211,8 @@ def test_identity_message_survives_ordinary_flood() -> None:
     plugin, context = _plugin()
     # 建立最低配置：让 1900000001 进入保护候选
     plugin._plugin_config_instance = SimpleNamespace(
-        plugin=SimpleNamespace(enabled=True, user_count=1, enable_private_inject=True),
-        user1=SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id=""),
+        plugin=SimpleNamespace(enabled=True, enable_private_inject=True),
+        users=SimpleNamespace(entries=[SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id="")]),
     )
     plugin._cache_sender_snapshot(
         SenderSnapshot(
@@ -251,8 +251,8 @@ def test_protected_layer_caps_at_limit() -> None:
     """保护层达到上限后淘汰最旧身份消息，新身份消息保留，快照总数不超过 256。"""
     plugin, context = _plugin()
     plugin._plugin_config_instance = SimpleNamespace(
-        plugin=SimpleNamespace(enabled=True, user_count=1, enable_private_inject=True),
-        user1=SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id=""),
+        plugin=SimpleNamespace(enabled=True, enable_private_inject=True),
+        users=SimpleNamespace(entries=[SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id="")]),
     )
     limit = plugin_module._PROTECTED_INDEX_LIMIT_PER_SESSION
     for index in range(limit + 1):
@@ -279,8 +279,8 @@ def test_same_message_id_coverage_protected_to_ordinary() -> None:
     """同号先写入身份用户消息再被普通用户覆盖，快照应按最新值为准。"""
     plugin, context = _plugin()
     plugin._plugin_config_instance = SimpleNamespace(
-        plugin=SimpleNamespace(enabled=True, user_count=1, enable_private_inject=True),
-        user1=SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id=""),
+        plugin=SimpleNamespace(enabled=True, enable_private_inject=True),
+        users=SimpleNamespace(entries=[SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id="")]),
     )
     plugin._cache_sender_snapshot(
         SenderSnapshot(
@@ -307,8 +307,8 @@ def test_same_message_id_coverage_ordinary_to_protected() -> None:
     """同号先写入普通用户，后写入身份用户，快照按最新且进入保护层。"""
     plugin, context = _plugin()
     plugin._plugin_config_instance = SimpleNamespace(
-        plugin=SimpleNamespace(enabled=True, user_count=1, enable_private_inject=True),
-        user1=SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id=""),
+        plugin=SimpleNamespace(enabled=True, enable_private_inject=True),
+        users=SimpleNamespace(entries=[SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id="")]),
     )
     plugin._cache_sender_snapshot(
         SenderSnapshot(
@@ -338,7 +338,7 @@ def test_host_query_passes_chat_id() -> None:
 
         async def get_by_id(self, message_id: str, **kwargs: Any) -> dict[str, Any]:
             self.calls.append({"message_id": message_id, "kwargs": dict(kwargs)})
-            return {"success": True, "message": None}
+            return None
 
     context.message = TrackingApi()
     asyncio.run(plugin._resolve_speaker_snapshot("group-a", "test-msg"))
@@ -381,8 +381,8 @@ def test_reclassify_moves_between_layers() -> None:
     plugin, context = _plugin()
     # 初始：1900000001 在保护，2000000002 在普通
     plugin._plugin_config_instance = SimpleNamespace(
-        plugin=SimpleNamespace(enabled=True, user_count=1, enable_private_inject=True),
-        user1=SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id=""),
+        plugin=SimpleNamespace(enabled=True, enable_private_inject=True),
+        users=SimpleNamespace(entries=[SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id="")]),
     )
     plugin._cache_sender_snapshot(
         SenderSnapshot(
@@ -400,8 +400,8 @@ def test_reclassify_moves_between_layers() -> None:
     )
     # 热更新：user1 的 QQ 改成 2000000002
     plugin._plugin_config_instance = SimpleNamespace(
-        plugin=SimpleNamespace(enabled=True, user_count=1, enable_private_inject=True),
-        user1=SimpleNamespace(enabled=True, qq="2000000002", nickname="主人", group_id=""),
+        plugin=SimpleNamespace(enabled=True, enable_private_inject=True),
+        users=SimpleNamespace(entries=[SimpleNamespace(enabled=True, qq="2000000002", nickname="主人", group_id="")]),
     )
     plugin._reclassify_session_snapshots()
 
@@ -414,9 +414,9 @@ def test_ttl_purges_both_layers_together() -> None:
     """TTL 过期后整个 SessionIndex 被移除，普通层和保护层同时消失。"""
     plugin, context = _plugin()
     plugin._plugin_config_instance = SimpleNamespace(
-        plugin=SimpleNamespace(enabled=True, user_count=1, enable_private_inject=True,
+        plugin=SimpleNamespace(enabled=True, enable_private_inject=True,
                                cache_ttl_seconds=1),
-        user1=SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id=""),
+        users=SimpleNamespace(entries=[SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id="")]),
     )
     old_time = time.time() - 9999
     plugin._cache_sender_snapshot(
@@ -443,9 +443,9 @@ def test_active_session_not_purged() -> None:
     """活跃会话的索引不被 TTL 清理，仍可精确命中。"""
     plugin, context = _plugin()
     plugin._plugin_config_instance = SimpleNamespace(
-        plugin=SimpleNamespace(enabled=True, user_count=1, enable_private_inject=True,
+        plugin=SimpleNamespace(enabled=True, enable_private_inject=True,
                                cache_ttl_seconds=1),
-        user1=SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id=""),
+        users=SimpleNamespace(entries=[SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id="")]),
     )
     plugin._cache_sender_snapshot(
         SenderSnapshot(
@@ -462,8 +462,8 @@ def test_max_snapshots_per_session_is_256() -> None:
     """保护层和普通层各满 128 时，单一会话快照总数不超过 256。"""
     plugin, context = _plugin()
     plugin._plugin_config_instance = SimpleNamespace(
-        plugin=SimpleNamespace(enabled=True, user_count=1, enable_private_inject=True),
-        user1=SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id=""),
+        plugin=SimpleNamespace(enabled=True, enable_private_inject=True),
+        users=SimpleNamespace(entries=[SimpleNamespace(enabled=True, qq="1900000001", nickname="主人", group_id="")]),
     )
     p_lim = plugin_module._PROTECTED_INDEX_LIMIT_PER_SESSION
     o_lim = plugin_module._MESSAGE_INDEX_LIMIT_PER_SESSION

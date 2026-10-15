@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "khiqwq.owner_auth_plugin",
-  "version": "2.2.2",
+  "version": "2.3.0",
   "name": "用户身份验证插件",
   "description": "通过 QQ 号精确验证特殊用户身份，按消息号向 Planner 传递可信身份与规划便签，并向 Replyer 注入独立回复便签。支持多个用户、群聊范围和 Identity Only 模式。",
   "author": {

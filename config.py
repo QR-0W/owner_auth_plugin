@@ -1,45 +1,19 @@
 """用户身份验证插件的配置模型（与 plugin.py 分离，便于维护）。
 
-固定槽位 + 「用户数量控制」数字：该数字 = 生成并显示的用户槽位个数（填 N 就生成 N 个，上限
-``USER_SLOTS``），每个槽位各自独立 QQ / 昵称 / 限制群聊群号 / 多行模板 / 启用开关。
-顶层 ``OwnerAuthConfig`` 用 ``create_model`` 动态绑定 plugin + user1..userN。
+用户以对象列表保存，原生配置页直接增删列表项；列表长度即用户数量。
+每项独立配置 QQ、关系称呼、群范围、两张便签和启用开关，保存后热更新。
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Literal
-
-import tomllib
+from typing import List, Literal
 
 from maibot_sdk import PluginConfigBase
-from pydantic import Field, create_model
+from pydantic import Field
 
-# 插件 / 配置版本号（plugin.py、_manifest.json 与本文件保持一致）。
-PLUGIN_VERSION = "2.2.2"
-
-# 生成的用户槽位数 USER_SLOTS = 已保存的 user_count —— 不写死上限、也不留多余空槽位
-# （config.toml 里有几个用户就几个 [userN] 表，干净）。固定槽位（每用户独立多行模板、非动态列表）天生
-# 要在配置模型里预先生成 N 个字段；N 在本模块导入时按磁盘上已保存的 user_count 算出。因此把「用户数量
-# 控制」调大后，到插件管理处把本插件「禁用再启用」（或重启麦麦）触发重新导入，即按新数量生成槽位——无硬上限。
-
-
-def _saved_user_count() -> int:
-    """读磁盘 config.toml 已保存的 user_count（导入期用，决定生成多少槽位）；读不到/异常按 1。"""
-
-    try:
-        path = Path(__file__).resolve().parent / "config.toml"
-        if not path.exists():
-            return 1
-        with path.open("rb") as handle:
-            data = tomllib.load(handle)
-        plugin_section = data.get("plugin") if isinstance(data, dict) else None
-        return max(1, int((plugin_section or {}).get("user_count", 1)))
-    except Exception:  # noqa: BLE001 - 读不到就按 1，绝不让导入失败
-        return 1
-
-
-USER_SLOTS = max(_saved_user_count(), 1)
+# 插件版本与配置兼容版本分开，避免宿主版本重建先裁剪旧 userN 数据。
+PLUGIN_VERSION = "2.3.0"
+CONFIG_VERSION = "2.2.2"
 
 DEFAULT_REPLYER_TEMPLATE = (
     "回复「{relation}」时保持自然、熟悉且更上心的语气；需要直接称呼时使用「{relation}」，"
@@ -53,7 +27,7 @@ DEFAULT_PLANNER_TEMPLATE = (
 
 
 class GeneralSectionConfig(PluginConfigBase):
-    """通用设置（位于「插件」页）。"""
+    """插件通用设置。"""
 
     __ui_label__ = "通用设置"
     __ui_icon__ = "settings"
@@ -63,11 +37,6 @@ class GeneralSectionConfig(PluginConfigBase):
         default=True,
         description="总开关，关闭后插件不再注入任何身份提示词",
         json_schema_extra={"label": "启用插件"},
-    )
-    user_count: int = Field(
-        default=1,
-        description="生成并显示几个用户槽位（无硬上限，按需自动生成；调大后重载一次即自动多生成槽位）；调小并保存后会清空超出的槽位",
-        json_schema_extra={"label": "用户数量控制", "min": 1},
     )
     enable_private_inject: bool = Field(
         default=True,
@@ -95,14 +64,14 @@ class GeneralSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "身份索引会话有效期(秒)", "min": 10, "max": 3600},
     )
     config_version: str = Field(
-        default=PLUGIN_VERSION,
-        description="配置版本号（请勿手动修改）",
-        json_schema_extra={"label": "配置版本", "disabled": True},
+        default=CONFIG_VERSION,
+        description="配置兼容版本（与插件版本独立，请勿手动修改）",
+        json_schema_extra={"label": "配置兼容版本", "disabled": True},
     )
 
 
 class UserSlotConfig(PluginConfigBase):
-    """单个用户槽位配置基类（每个用户拥有独立的 QQ / 昵称 / 限制群聊 / 提示词）。"""
+    """单个用户条目，每项拥有独立的 QQ、关系称呼、群范围和便签。"""
 
     enabled: bool = Field(
         default=True,
@@ -112,12 +81,12 @@ class UserSlotConfig(PluginConfigBase):
     qq: str = Field(
         default="",
         description="该用户的 QQ 号，留空表示此槽位未配置",
-        json_schema_extra={"label": "用户 QQ 号"},
+        json_schema_extra={"label": "用户 QQ 号", "placeholder": "留空不认证"},
     )
     nickname: str = Field(
         default="用户",
         description="对该身份的关系称呼，会替换模板中的 {relation}",
-        json_schema_extra={"label": "用户昵称"},
+        json_schema_extra={"label": "关系称呼", "placeholder": "例如：主人、老师"},
     )
     group_id: str = Field(
         default="",
@@ -125,7 +94,7 @@ class UserSlotConfig(PluginConfigBase):
             "限制该用户身份只在某个群生效：填群号则该用户仅在这个群被认作用户，"
             "留空则所有聊天流（含私聊）都生效。同一 QQ 可在不同槽位分别配全局与群专属，群专属优先。"
         ),
-        json_schema_extra={"label": "限制群聊（群号）"},
+        json_schema_extra={"label": "限制群聊（群号）", "placeholder": "留空全局生效；同一 QQ 群专属优先"},
     )
     planner_prompt_template: str = Field(
         default=DEFAULT_PLANNER_TEMPLATE,
@@ -134,7 +103,7 @@ class UserSlotConfig(PluginConfigBase):
             "{relation}=关系称呼，{display_name}=聊天显示名，{user_id}=已认证账号，"
             "{message}=该用户消息，{relations}=所有启用身份的关系称呼"
         ),
-        json_schema_extra={"label": "Planner 规划便签"},
+        json_schema_extra={"label": "Planner 规划便签", "placeholder": "留空仅传递身份；支持 {relation}、{message} 等占位符"},
     )
     replyer_prompt_template: str = Field(
         default=DEFAULT_REPLYER_TEMPLATE,
@@ -143,42 +112,37 @@ class UserSlotConfig(PluginConfigBase):
             "{relation}=关系称呼，{display_name}=聊天显示名，{user_id}=已认证账号，"
             "{message}=发言者本次消息，{relations}=所有启用身份的关系称呼"
         ),
-        json_schema_extra={"label": "Replyer 回复便签"},
+        json_schema_extra={"label": "Replyer 回复便签", "placeholder": "留空仅传递身份；支持 {relation}、{message} 等占位符"},
     )
 
 
-def _make_slot_class(index: int) -> type[UserSlotConfig]:
-    """为第 index 个用户槽位生成一个 UserSlotConfig 子类（仅 WebUI 展示元数据不同）。
+class UsersSectionConfig(PluginConfigBase):
+    """由原生列表控件管理用户，不再额外配置用户数量。"""
 
-    用 type() 生成 UserSlotConfig 的子类，字段全部继承自 UserSlotConfig（不动态新增字段，
-    因此与手写 UserNConfig 等价、风险低）；只设置 __ui_label__/__ui_icon__/__ui_order__。
-    """
+    __ui_label__ = "用户"
+    __ui_icon__ = "users"
+    __ui_order__ = 2
 
-    return type(
-        f"User{index}Config",
-        (UserSlotConfig,),
-        {
-            "__ui_label__": f"用户 {index}",
-            "__ui_icon__": "user",
-            "__ui_order__": 10 + index,
+    entries: List[UserSlotConfig] = Field(
+        default_factory=list,
+        description="用户身份列表，添加、删除或排序后保存即可生效，无需重载插件。",
+        json_schema_extra={
+            "label": "用户身份列表",
+            "hint": (
+                "点击「添加项目」新增用户；删除或拖动排序后需保存。关闭「启用此用户」仅停用，不删除数据。"
+                "同一 QQ 群专属优先；相同范围重复时取列表中第一个。"
+                "两张便签留空时仅传递身份，支持 {relation}、{display_name}、{user_id}、{message}、{relations}。"
+                "原生列表以单行框编辑便签；已有多行内容会保留，多行编辑请使用配置源码模式。"
+            ),
         },
     )
 
 
-# 预生成 USER_SLOTS 个槽位类（user1..userN）。
-SLOT_CLASSES: list[type[UserSlotConfig]] = [_make_slot_class(i) for i in range(1, USER_SLOTS + 1)]
+class OwnerAuthConfig(PluginConfigBase):
+    """固定配置结构；用户增减仅改变列表数据。"""
 
+    __ui_label__ = "用户身份验证"
 
-# 顶层配置：plugin + user1..userN。用 create_model 动态绑定 N 个用户槽位字段。
-# 区块名必须含 plugin：宿主的 extract_plugin_config_version 要求 [plugin].config_version 存在。
-_OWNER_FIELD_DEFS: dict[str, Any] = {
-    "plugin": (GeneralSectionConfig, Field(default_factory=GeneralSectionConfig)),
-}
-for _i, _slot_cls in enumerate(SLOT_CLASSES, start=1):
-    _OWNER_FIELD_DEFS[f"user{_i}"] = (_slot_cls, Field(default_factory=_slot_cls))
-OwnerAuthConfig = create_model(
-    "OwnerAuthConfig",
-    __base__=PluginConfigBase,
-    **_OWNER_FIELD_DEFS,
-)
-OwnerAuthConfig.__ui_label__ = "用户身份验证"
+    # 宿主要求 [plugin].config_version 存在。
+    plugin: GeneralSectionConfig = Field(default_factory=GeneralSectionConfig)
+    users: UsersSectionConfig = Field(default_factory=UsersSectionConfig)
