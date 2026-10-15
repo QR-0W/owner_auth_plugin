@@ -3,4 +3,5 @@ config.toml
 config_back/
 __pycache__/
 *.py[cod]
+logs/
 .DS_Store
